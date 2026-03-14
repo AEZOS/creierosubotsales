@@ -14,6 +14,7 @@ class AdminItem(StatesGroup):
 class AdminStock(StatesGroup):
     waiting_for_item = State()
     waiting_for_image = State()
+    waiting_for_bundle = State()
 
 class AdminRemoval(StatesGroup):
     waiting_for_cat_confirm = State()

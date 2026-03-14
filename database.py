@@ -5,6 +5,10 @@ DB_PATH = "bot_database.sqlite"
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA synchronous=NORMAL")
+        await db.execute("PRAGMA busy_timeout=5000") # 5 seconds
+        
         # Users table
         await db.execute('''
             CREATE TABLE IF NOT EXISTS users (
@@ -39,12 +43,14 @@ async def init_db():
             )
         ''')
 
-        # Item Images / Stock table
+        # Item Images / Stock table (Now supports multiple media per secret)
         await db.execute('''
             CREATE TABLE IF NOT EXISTS item_images (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 item_id INTEGER,
                 image_url TEXT,
+                media_type TEXT DEFAULT 'photo', -- 'photo', 'video', 'text'
+                secret_group TEXT DEFAULT NULL,   -- Groups multiple items into one 'secret'
                 is_sold BOOLEAN DEFAULT 0,
                 FOREIGN KEY (item_id) REFERENCES items (id)
             )
@@ -98,6 +104,12 @@ async def init_db():
         try:
             await db.execute("ALTER TABLE sales ADD COLUMN tx_hash TEXT UNIQUE DEFAULT NULL")
         except: pass
+        try:
+            await db.execute("ALTER TABLE item_images ADD COLUMN media_type TEXT DEFAULT 'photo'")
+        except: pass
+        try:
+            await db.execute("ALTER TABLE item_images ADD COLUMN secret_group TEXT DEFAULT NULL")
+        except: pass
 
         
         await db.commit()
@@ -106,51 +118,74 @@ async def init_db():
 
 # --- Repository functions ---
 
-async def get_available_address(timeout_minutes: int):
+async def get_and_create_sale(user_tg_id: int, item_id: int, base_amount: float, timeout_minutes: int):
     """
-    Finds an address that is not in use or whose lock has expired.
-    Returns (address, sale_id_to_clear_if_any)
+    Finds an address and creates a pending sale. 
+    If all addresses are "locked", it reuses one but adds a small increment (0.0001 LTC) 
+    to the amount to stay unique.
+    Returns (address, final_amount, sale_id).
     """
-    from datetime import datetime, timedelta
-    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    
-    async with aiosqlite.connect(DB_PATH) as db:
-        # 1. Look for a truly free address
-        async with db.execute("SELECT crypto_address FROM addresses WHERE in_use_by_sale_id IS NULL LIMIT 1") as cursor:
-            row = await cursor.fetchone()
-            if row:
-                return row[0], None
-        
-        # 2. Look for an address whose lock expired
-        async with db.execute("SELECT crypto_address, in_use_by_sale_id FROM addresses WHERE locked_until < ? LIMIT 1", (now_str,)) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                return row[0], row[1]
-                
-    return None, None
-
-async def create_sale(user_id: int, item_id: int, amount: float, address: str, timeout_minutes: int):
     from datetime import datetime, timedelta
     now = datetime.now()
-    expires_at = now + timedelta(minutes=timeout_minutes)
     now_str = now.strftime('%Y-%m-%d %H:%M:%S')
+    expires_at = now + timedelta(minutes=timeout_minutes)
     expires_str = expires_at.strftime('%Y-%m-%d %H:%M:%S')
-    
+
     async with aiosqlite.connect(DB_PATH) as db:
-        # Create sale
-        cursor = await db.execute(
-            "INSERT INTO sales (user_id, item_id, amount_expected, address_used, created_at, status) VALUES ((SELECT id FROM users WHERE telegram_id=?), ?, ?, ?, ?, 'pending')",
-            (user_id, item_id, amount, address, now_str)
-        )
-        sale_id = cursor.lastrowid
+        db.row_factory = aiosqlite.Row
         
-        # Lock address
-        await db.execute(
-            "UPDATE addresses SET in_use_by_sale_id = ?, locked_until = ? WHERE crypto_address = ?",
-            (sale_id, expires_str, address)
-        )
+        # 1. Get all addresses
+        async with db.execute("SELECT crypto_address FROM addresses") as cursor:
+            all_addrs = await cursor.fetchall()
+            
+        if not all_addrs:
+            return None, None, None
+
+        # 2. Find the "best" address (the one with fewest active PENDING sales)
+        # We also check which addresses are truly free (no paid/confirming/pending sales currently active there)
+        # Actually, let's just count active sales (status IN ('pending', 'confirming'))
+        addr_usage = {}
+        for row in all_addrs:
+            addr = row['crypto_address']
+            async with db.execute("""
+                SELECT COUNT(*) FROM sales 
+                WHERE address_used = ? AND status IN ('pending', 'confirming')
+            """, (addr,)) as cnt_cursor:
+                count = (await cnt_cursor.fetchone())[0]
+                addr_usage[addr] = count
+
+        # Sort addresses by usage count, pick the lowest
+        sorted_addrs = sorted(addr_usage.items(), key=lambda x: x[1])
+        address, current_active_on_addr = sorted_addrs[0]
+
+        # 3. Calculate final amount: base_amount + (offset * 0.0001)
+        # To be extra safe, we'll check if any other active sale on this address HAS this exact amount
+        offset = 0
+        while True:
+            final_amount = round(base_amount + (offset * 0.0001), 5)
+            async with db.execute("""
+                SELECT 1 FROM sales 
+                WHERE address_used = ? AND amount_expected = ? AND status IN ('pending', 'confirming')
+            """, (address, final_amount)) as ex_cursor:
+                if not await ex_cursor.fetchone():
+                    break
+                offset += 1
+
+        # 4. Create Sale
+        cursor = await db.execute("""
+            INSERT INTO sales (user_id, item_id, amount_expected, address_used, created_at, status) 
+            VALUES ((SELECT id FROM users WHERE telegram_id=?), ?, ?, ?, ?, 'pending')
+        """, (user_tg_id, item_id, final_amount, address, now_str))
+        sale_id = cursor.lastrowid
+
+        # 5. Lock Address record (optional since we multiplex now, but good for tracking)
+        await db.execute("""
+            UPDATE addresses SET in_use_by_sale_id = ?, locked_until = ? 
+            WHERE crypto_address = ?
+        """, (sale_id, expires_str, address))
+        
         await db.commit()
-        return sale_id
+        return address, final_amount, sale_id
 
 async def seed_addresses(addresses_list: list):
     async with aiosqlite.connect(DB_PATH) as db:

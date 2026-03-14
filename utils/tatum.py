@@ -30,8 +30,8 @@ async def check_ltc_transaction(address: str, amount_expected: float, timestamp_
                     for out in outputs:
                         if out.get("address") == address:
                             val = float(out.get("value", "0"))
-                            # Allow if payment is equal or more than price (accepts overpayments)
-                            if val >= (amount_expected - 0.00000001): 
+                            # Precision matching for multiplexed addresses
+                            if abs(val - amount_expected) < 0.00005: 
 
                                 confirmations = tx.get("confirmations", 0)
                                 tx_hash = tx.get("hash", "")

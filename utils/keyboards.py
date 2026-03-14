@@ -27,7 +27,7 @@ def admin_main_menu() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="📈 Istoric Vânzări", callback_data="admin_history"),
-            InlineKeyboardButton(text="❌ Vânzări Anulate", callback_data="admin_cancelled")
+            InlineKeyboardButton(text="⏳ Precomenzi", callback_data="admin_preorders")
         ],
         [InlineKeyboardButton(text="🔙 Ieșire", callback_data="menu_start")]
     ])

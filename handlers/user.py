@@ -2,7 +2,7 @@ from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from utils.keyboards import main_menu
-from database import add_user, DB_PATH, get_available_address, create_sale
+from database import add_user, DB_PATH, get_and_create_sale
 from config import DEPOSIT_TIMEOUT_MINUTES, ADMIN_IDS
 import os
 from utils.tatum import check_ltc_transaction
@@ -10,11 +10,106 @@ from utils.ltc_price import get_ltc_ron_price, ron_to_ltc
 import aiosqlite
 import logging
 import asyncio
+import time
 
 router = Router()
 
+# Cooldown for buttons (Anti-spam)
+button_cooldowns = {} # (user_id, callback_data) -> last_press_time
+BOT_START_TIME = time.time()
+active_verifications = set() # sale_id
+
+async def check_and_show_pending(event: CallbackQuery | Message) -> bool:
+    """Check if user has a pending order and show it if they do. Returns True if pending was found."""
+    user_tg_id = event.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT sales.id, items.name, sales.amount_expected, sales.address_used, sales.created_at, items.price_ron, sales.status
+            FROM sales 
+            JOIN items ON sales.item_id = items.id 
+            JOIN users ON sales.user_id = users.id
+            WHERE users.telegram_id = ? AND sales.status IN ('pending', 'confirming')
+        """, (user_tg_id,)) as cursor:
+            pending = await cursor.fetchone()
+
+    if pending:
+        sale_id, item_name, amount_ltc, address, created_at, price_ron, status = pending
+        
+        # Calculate time left
+        from datetime import datetime, timedelta
+        created_dt = datetime.strptime(created_at, '%Y-%m-%d %H:%M:%S')
+        expiry_dt = created_dt + timedelta(minutes=DEPOSIT_TIMEOUT_MINUTES)
+        now = datetime.now()
+        
+        # Don't auto-cancel if it's already confirming
+        if now > expiry_dt and status == 'pending':
+            # Silent auto-cancel if they try to access an expired order
+            async with aiosqlite.connect(DB_PATH) as db:
+                # Double check status before cancelling
+                await db.execute("UPDATE sales SET status = 'cancelled' WHERE id = ? AND status = 'pending'", (sale_id,))
+                await db.execute("UPDATE addresses SET in_use_by_sale_id = NULL, locked_until = NULL WHERE in_use_by_sale_id = ?", (sale_id,))
+                await db.commit()
+            return False 
+            
+        time_left = expiry_dt - now
+        minutes_left = max(0, int(time_left.total_seconds() // 60))
+        
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Verifică Plata", callback_data=f"verify_pay_{sale_id}")],
+            [InlineKeyboardButton(text="❌ Anulează Comanda", callback_data=f"cancel_order_{sale_id}")]
+        ])
+        
+        text = (
+            f"⏳ <b>COMANDĂ ACTIVĂ (# {sale_id})</b>\n"
+            f"Status: <code>{status.upper()}</code>\n\n"
+            f"Ai o comandă activă pentru: <b>{item_name}</b>\n\n"
+            f"💰 <b>Sumă:</b> <code>{amount_ltc}</code> LTC (~{int(price_ron)} RON)\n"
+            f"📍 <b>Adresă:</b> <code>{address}</code>\n\n"
+            f"⏰ Expiră în: <b>{minutes_left} minute</b>\n"
+            f"<i>Comanda va fi anulată automat dacă plata nu este detectată în acest timp.</i>"
+        )
+        
+        if isinstance(event, CallbackQuery):
+            try:
+                if event.message.photo: await event.message.edit_caption(caption=text, reply_markup=kb)
+                else: await event.message.edit_text(text, reply_markup=kb)
+            except:
+                pass # Content already matches, ignore error
+            await event.answer()
+        else:
+            await event.answer(text, reply_markup=kb)
+        return True
+    return False
+
+async def check_cooldown(callback: CallbackQuery) -> bool:
+    """Returns True if user is on cooldown for THIS specific button, False otherwise."""
+    user_id = callback.from_user.id
+    btn_data = callback.data
+    now = time.time()
+    
+    key = (user_id, btn_data)
+    # Per-button cooldown to prevent double taps/spam (1s)
+    if key in button_cooldowns:
+        if now - button_cooldowns[key] < 1.0: 
+            await callback.answer("⏳ Ai răbdare...", show_alert=False)
+            return True
+            
+    # Global cooldown (0.3s) - helps with DB concurrency but allows fast navigation
+    global_key = (user_id, "global_cooldown")
+    # Exempt navigation buttons from global cooldown for better UX
+    is_nav = btn_data.startswith(("nav_", "menu_", "shop_cat_"))
+    if not is_nav and global_key in button_cooldowns:
+        if now - button_cooldowns[global_key] < 0.3:
+            return True 
+            
+    button_cooldowns[key] = now
+    button_cooldowns[global_key] = now
+    return False
+
 @router.message(CommandStart())
 async def cmd_start(message: Message):
+    if await check_and_show_pending(message): return
+
     await add_user(message.from_user.id, message.from_user.username)
     
     welcome_text = (
@@ -39,12 +134,16 @@ async def cmd_start(message: Message):
 
 @router.callback_query(F.data == "menu_profile")
 async def cb_menu_profile(callback: CallbackQuery):
+    if await check_cooldown(callback): return
+    if await check_and_show_pending(callback): return
+
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("""
-            SELECT items.name, sales.amount_paid, sales.created_at, sales.id, items.price_ron
+            SELECT items.name, sales.amount_expected, sales.created_at, sales.id, items.price_ron, sales.status
             FROM sales 
             JOIN items ON sales.item_id = items.id 
-            WHERE sales.user_id = ? AND sales.status = 'paid'
+            JOIN users ON sales.user_id = users.id
+            WHERE users.telegram_id = ?
             ORDER BY sales.created_at DESC
             LIMIT 5
         """, (callback.from_user.id,)) as cursor:
@@ -55,7 +154,7 @@ async def cb_menu_profile(callback: CallbackQuery):
     username = f" (@{user.username})" if user.username else ""
     
     text = (
-        f"� <b>Profil Utilizator</b>\n\n"
+        f"👤 <b>Profil Utilizator</b>\n\n"
         f"🆔 <b>ID:</b> <code>{user.id}</code>\n"
         f"👤 <b>Nume:</b> {full_name}{username}\n\n"
         f"📦 <b>Istoric Comenzi (Ultimele 5):</b>\n"
@@ -63,11 +162,21 @@ async def cb_menu_profile(callback: CallbackQuery):
     
     kb_buttons = []
     if not orders:
-        text += "<i>Momentan nu ai nicio comandă finalizată.</i>"
+        text += "<i>Momentan nu ai nicio comandă.</i>"
     else:
         for o in orders:
-            text += f"🔹 #{o[3]} | <b>{o[0]}</b>\nPreț: {int(o[4])} RON ({o[1]} LTC) | {o[2]}\n\n"
-            kb_buttons.append([InlineKeyboardButton(text=f"👁 Vezi #{o[3]} ({o[0]})", callback_data=f"view_secret_{o[3]}")])
+            status_map = {
+                'paid': '✅ Finalizată',
+                'cancelled': '❌ Anulată',
+                'pending': '⏳ În așteptare',
+                'confirming': '🔄 Verificare'
+            }
+            s_label = status_map.get(o[5], o[5])
+            text += f"🔹 #{o[3]} | <b>{o[0]}</b>\nPreț: {int(o[4])} RON | {s_label}\n\n"
+            if o[5] == 'paid':
+                kb_buttons.append([InlineKeyboardButton(text=f"👁 Vezi Conținut #{o[3]}", callback_data=f"view_secret_{o[3]}")])
+            elif o[5] in ('pending', 'confirming'):
+                kb_buttons.append([InlineKeyboardButton(text=f"🛍 Vezi Comandă Activă #{o[3]}", callback_data="check_pending_manual")])
         
     kb_buttons.append([InlineKeyboardButton(text="🔙 Înapoi", callback_data="menu_start")])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
@@ -98,36 +207,60 @@ async def cb_menu_profile(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("view_secret_"))
 async def cb_view_order_secret(callback: CallbackQuery):
+    if await check_cooldown(callback): return
+    # We DON'T block viewing old orders if they have a pending one?
+    # Actually, the user said "whatever other button". So yes, block it.
+    if await check_and_show_pending(callback): return
     sale_id = int(callback.data.split("_")[2])
     
     async with aiosqlite.connect(DB_PATH) as db:
+        # Get sale info and the group ID of the secret
         async with db.execute("""
-            SELECT items.name, item_images.image_url, sales.user_id, users.telegram_id
+            SELECT items.name, sales.user_id, users.telegram_id, item_images.secret_group, item_images.image_url, item_images.media_type
             FROM sales
             JOIN items ON sales.item_id = items.id
-            JOIN item_images ON sales.image_id = item_images.id
             JOIN users ON sales.user_id = users.id
+            JOIN item_images ON sales.image_id = item_images.id
             WHERE sales.id = ? AND sales.status = 'paid'
         """, (sale_id,)) as cursor:
             data = await cursor.fetchone()
             
-    if not data or data[3] != callback.from_user.id:
+    if not data or data[2] != callback.from_user.id:
         await callback.answer("Comandă neautorizată sau inexistentă.", show_alert=True)
         return
         
-    name, img_url, _, _ = data
-    msg_text = f"📦 <b>Conținut Comandă #{sale_id}</b>\nProdus: <b>{name}</b>"
+    name, _, user_tg_id, group_id, first_url, first_type = data
     
-    if img_url.startswith("http") or len(img_url) > 40:
-        await callback.bot.send_photo(callback.from_user.id, photo=img_url, caption=msg_text)
-    else:
-        await callback.bot.send_message(callback.from_user.id, f"{msg_text}\n\nConținut:\n<code>{img_url}</code>")
+    # Fetch ALL content from the bundle
+    async with aiosqlite.connect(DB_PATH) as db:
+        if group_id:
+            async with db.execute("SELECT image_url, media_type FROM item_images WHERE secret_group = ?", (group_id,)) as cursor:
+                contents = await cursor.fetchall()
+        else:
+            contents = [(first_url, first_type)]
+
+    msg_text = f"📦 <b>Conținut Comandă #{sale_id}</b>\nProdus: <b>{name}</b>"
+    await callback.bot.send_message(user_tg_id, msg_text)
+
+    for val, m_type in contents:
+        try:
+            if m_type == 'photo':
+                await callback.bot.send_photo(user_tg_id, photo=val)
+            elif m_type == 'video':
+                await callback.bot.send_video(user_tg_id, video=val)
+            else:
+                await callback.bot.send_message(user_tg_id, f"<code>{val}</code>")
+        except:
+             # Fallback if file_id is somehow invalid or it was just text in image_url
+             await callback.bot.send_message(user_tg_id, f"<code>{val}</code>")
         
-    await callback.answer("Ți-am retrimis mesajul cu stocul!", show_alert=True)
+    await callback.answer("Ți-am retrimis mesajele cu stocul!", show_alert=True)
 
 
 @router.callback_query(F.data == "menu_support")
 async def cb_menu_support(callback: CallbackQuery):
+    if await check_cooldown(callback): return
+    if await check_and_show_pending(callback): return
     text = (
         "💬 <b>Centru de Suport</b>\n\n"
         "Ai nevoie de ajutor cu o comandă sau ai întrebări despre produse?\n\n"
@@ -163,8 +296,11 @@ async def cb_menu_support(callback: CallbackQuery):
 
 @router.callback_query(F.data == "menu_shop")
 async def cb_menu_shop(callback: CallbackQuery):
+    if await check_cooldown(callback): return
+    if await check_and_show_pending(callback): return
+
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id, name FROM categories LIMIT 9") as cursor:
+        async with db.execute("SELECT id, name FROM categories") as cursor:
             cats = await cursor.fetchall()
             
     if not cats:
@@ -211,6 +347,9 @@ async def cb_menu_shop(callback: CallbackQuery):
 
 @router.callback_query(F.data == "menu_start")
 async def cb_menu_start(callback: CallbackQuery):
+    if await check_cooldown(callback): return
+    if await check_and_show_pending(callback): return
+    
     welcome_text = "🏙 <b>Seiful Digital Premium</b>\n\n🛒 Alege o categorie sau folosește meniul de mai jos."
     kb = main_menu()
     if callback.from_user.id in ADMIN_IDS:
@@ -235,6 +374,9 @@ async def cb_menu_start(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("shop_cat_"))
 async def cb_shop_cat(callback: CallbackQuery):
+    if await check_cooldown(callback): return
+    if await check_and_show_pending(callback): return
+
     data_parts = callback.data.split("_")
     if len(data_parts) < 3 or not data_parts[2].isdigit():
         return # Safety skip for malformed or non-numeric IDs
@@ -252,16 +394,34 @@ async def cb_shop_cat(callback: CallbackQuery):
             
         cat_name, cat_img, cat_desc = cat_info
 
-        # Fetch items
+        # Fetch items with soft-locked stock logic
         async with db.execute("""
-            SELECT items.id, items.name, items.price_ron, items.price_ltc, COUNT(item_images.id) as stock
+            SELECT items.id, items.name, items.price_ron, 
+                   (SELECT COUNT(*) FROM item_images WHERE item_id = items.id AND is_sold = 0) as raw_stock,
+                   (SELECT COUNT(*) FROM sales WHERE item_id = items.id AND status = 'confirming') as confirming_count
             FROM items 
-            LEFT JOIN item_images ON items.id = item_images.item_id AND item_images.is_sold = 0
             WHERE items.category_id = ?
             GROUP BY items.id
             ORDER BY items.price_ron ASC
         """, (cat_id,)) as cursor:
-            items = await cursor.fetchall()
+            rows = await cursor.fetchall()
+            
+        items = []
+        for r in rows:
+            # Use dictionary-like access if possible or safe indices
+            i_id = r[0]
+            i_name = r[1]
+            p_ron = r[2]
+            raw_stock = r[3]
+            conf_count = r[4]
+            adj_stock = max(0, raw_stock - conf_count)
+            # Store everything we need in the tuple
+            items.append({
+                'id': i_id,
+                'name': i_name,
+                'price': p_ron,
+                'stock': adj_stock
+            })
             
     if not items:
         # Show description even if no items
@@ -270,14 +430,14 @@ async def cb_shop_cat(callback: CallbackQuery):
     else:
         kb_rows = []
         for item in items:
-            stock_count = item[4]
+            stock_count = item['stock']
             if stock_count > 0:
-                btn_text = f"{item[1]}"
-                btn_style = "success"
+                btn_text = f"{item['name']}"
             else:
-                btn_text = f"{item[1]}"
-                btn_style = "danger"
-            kb_rows.append([InlineKeyboardButton(text=btn_text, callback_data=f"shop_item_{item[0]}", style=btn_style)])
+                # User preferred "plain red" style - since standard buttons are grey,
+                # removing the custom text suffix to keep it simple.
+                btn_text = f"🚫 {item['name']}"
+            kb_rows.append([InlineKeyboardButton(text=btn_text, callback_data=f"shop_item_{item['id']}")])
 
             
         kb_rows.append([InlineKeyboardButton(text="🔙 Înapoi la Categorii", callback_data="menu_shop")])
@@ -313,15 +473,19 @@ import aiogram
 
 @router.callback_query(F.data.startswith("shop_item_"))
 async def cb_shop_item(callback: CallbackQuery):
+    if await check_cooldown(callback): return
+    if await check_and_show_pending(callback): return
     item_id = int(callback.data.split("_")[2])
     
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("""
             SELECT items.name, items.description, items.price_ron, items.price_ltc, 
-                   COUNT(item_images.id), items.display_image, categories.display_image
+                   (SELECT COUNT(*) FROM item_images WHERE item_id = items.id AND is_sold = 0),
+                   items.display_image, categories.display_image,
+                   (SELECT COUNT(*) FROM sales WHERE item_id = items.id AND status = 'confirming'),
+                   items.category_id
             FROM items 
             JOIN categories ON items.category_id = categories.id
-            LEFT JOIN item_images ON items.id = item_images.item_id AND item_images.is_sold = 0
             WHERE items.id = ?
             GROUP BY items.id
         """, (item_id,)) as cursor:
@@ -331,7 +495,8 @@ async def cb_shop_item(callback: CallbackQuery):
         await callback.answer("Produsul nu a fost găsit", show_alert=True)
         return
 
-    name, desc, p_ron, p_ltc, stock, item_img, cat_img = item
+    name, desc, p_ron, p_ltc, raw_stock, item_img, cat_img, confirming_count, cat_id = item
+    stock = max(0, raw_stock - confirming_count)
     display_img = item_img if item_img else cat_img
     
     # Live LTC price
@@ -353,7 +518,7 @@ async def cb_shop_item(callback: CallbackQuery):
         kb.inline_keyboard.append([InlineKeyboardButton(text="⏳ Precomandă", callback_data=f"preorder_{item_id}", style="danger")])
 
         
-    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Înapoi", callback_data="nav_back_categories")])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Înapoi", callback_data=f"nav_back_cat_{cat_id}")])
 
 
     if display_img:
@@ -378,19 +543,31 @@ async def cb_shop_item(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("nav_back_cat_"))
+async def cb_nav_back_cat(callback: CallbackQuery):
+    if await check_cooldown(callback): return
+    cat_id = int(callback.data.split("_")[3])
+    # Create fake data so we can reuse the existing function
+    callback.data = f"shop_cat_{cat_id}"
+    await cb_shop_cat(callback)
+
 @router.callback_query(F.data == "nav_back_categories")
 async def cb_nav_back_categories(callback: CallbackQuery):
+    if await check_cooldown(callback): return
     await cb_menu_shop(callback)
 
 @router.callback_query(F.data.startswith("preorder_"))
 async def cb_preorder(callback: CallbackQuery):
+    if await check_cooldown(callback): return
+    if await check_and_show_pending(callback): return
+
     item_id = int(callback.data.split("_")[1])
     user_tg_id = callback.from_user.id
     
     async with aiosqlite.connect(DB_PATH) as db:
         # Check for 24h spam
         from datetime import datetime, timedelta
-        limit_time = (datetime.now() - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
+        limit_time = (datetime.now() - timedelta(hours=6)).strftime('%Y-%m-%d %H:%M:%S')
         
         async with db.execute("""
             SELECT created_at FROM preorders 
@@ -401,7 +578,7 @@ async def cb_preorder(callback: CallbackQuery):
             last_preorder = await cursor.fetchone()
             
         if last_preorder:
-            await callback.answer("⏳ Poți face o singură precomandă la 24 de ore pentru a evita spam-ul. Revino mâine!", show_alert=True)
+            await callback.answer("⏳ Poți face o singură precomandă la 6 ore. Revino mai târziu!", show_alert=True)
             return
 
         async with db.execute("SELECT name FROM items WHERE id = ?", (item_id,)) as cursor:
@@ -453,10 +630,55 @@ async def cb_preorder(callback: CallbackQuery):
     )
     await callback.answer()
 
+@router.callback_query(F.data.startswith("cancel_order_"))
+async def cb_cancel_order(callback: CallbackQuery):
+    if await check_cooldown(callback): return
+    sale_id = int(callback.data.split("_")[2])
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Check ownership
+        async with db.execute("""
+            SELECT sales.status FROM sales 
+            JOIN users ON sales.user_id = users.id 
+            WHERE sales.id = ? AND users.telegram_id = ?
+        """, (sale_id, callback.from_user.id)) as cursor:
+            row = await cursor.fetchone()
+            
+        if not row:
+            await callback.answer("Comandă inexistentă.", show_alert=True)
+            return
+            
+        if row[0] != 'pending':
+            await callback.answer("Această comandă nu mai poate fi anulată.", show_alert=True)
+            return
+
+        # Cancel it
+        await db.execute("UPDATE sales SET status = 'cancelled' WHERE id = ?", (sale_id,))
+        await db.execute("UPDATE addresses SET in_use_by_sale_id = NULL, locked_until = NULL WHERE in_use_by_sale_id = ?", (sale_id,))
+        await db.commit()
+    
+    await callback.answer("Comanda a fost anulată!", show_alert=True)
+    
+    # Send fresh menu
+    welcome_text = "🏙 <b>Seiful Digital Premium</b>\n\n🛒 Alege o categorie sau folosește meniul de mai jos."
+    kb = main_menu()
+    if callback.from_user.id in ADMIN_IDS:
+        kb.inline_keyboard.append([InlineKeyboardButton(text="🛠 Panou Admin", callback_data="admin_main")])
+        
+    img_path = "assets/2creier.jpg"
+    await callback.message.delete()
+    if os.path.exists(img_path):
+        await callback.message.answer_photo(FSInputFile(img_path), caption=welcome_text, reply_markup=kb)
+    else:
+        await callback.message.answer(welcome_text, reply_markup=kb)
+
+
 
 
 @router.callback_query(F.data.startswith("buy_item_"))
 async def cb_buy_item(callback: CallbackQuery):
+    if await check_cooldown(callback): return
+    if await check_and_show_pending(callback): return
+
     item_id = int(callback.data.split("_")[2])
     
     async with aiosqlite.connect(DB_PATH) as db:
@@ -473,7 +695,7 @@ async def cb_buy_item(callback: CallbackQuery):
     ltc_rate = await get_ltc_ron_price()
     price = ron_to_ltc(p_ron, ltc_rate)
     
-    address, old_sale_to_clear = await get_available_address(DEPOSIT_TIMEOUT_MINUTES)
+    address, final_price, sale_id = await get_and_create_sale(callback.from_user.id, item_id, price, DEPOSIT_TIMEOUT_MINUTES)
     
     if not address:
         await callback.answer(
@@ -481,8 +703,9 @@ async def cb_buy_item(callback: CallbackQuery):
             show_alert=True
         )
         return
-
-    sale_id = await create_sale(callback.from_user.id, item_id, price, address, DEPOSIT_TIMEOUT_MINUTES)
+    
+    # Use final_price for the rest of labels
+    price = final_price
     
     # Notify Admins about PENDING sale
     for admin_id in ADMIN_IDS:
@@ -514,8 +737,8 @@ async def cb_buy_item(callback: CallbackQuery):
 
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Am Depus", callback_data=f"verify_{sale_id}")],
-        [InlineKeyboardButton(text="❌ Anulare", callback_data="menu_shop")]
+        [InlineKeyboardButton(text="✅ Verifică Plata", callback_data=f"verify_pay_{sale_id}")],
+        [InlineKeyboardButton(text="❌ Anulează Comanda", callback_data=f"cancel_order_{sale_id}")]
     ])
     
     if callback.message.photo:
@@ -524,125 +747,202 @@ async def cb_buy_item(callback: CallbackQuery):
         await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
 
-@router.callback_query(F.data.startswith("verify_"))
+@router.callback_query(F.data.startswith("verify_pay_"))
 async def cb_verify_payment(callback: CallbackQuery):
-    sale_id = int(callback.data.split("_")[1])
-    # ... logic remains same ...
-    label = "⏳ Verificăm blockchain-ul LTC... Acest proces durează 1-5 minute."
+    if await check_cooldown(callback): return
+    sale_id = int(callback.data.split("_")[2])
+    
+    if sale_id in active_verifications:
+        await callback.answer("⏳ O verificare este deja în curs pentru această comandă. Te rugăm să aștepți.", show_alert=True)
+        return
+
+    label = "⏳ <b>VERIFICARE ACTIVĂ...</b>\n\nInterogăm blockchain-ul Litecoin. Te rugăm să aștepți confirmarea."
     if callback.message.photo:
         await callback.message.edit_caption(caption=label, reply_markup=None)
     else:
         await callback.message.edit_text(label, reply_markup=None)
     await callback.answer()
 
+    active_verifications.add(sale_id)
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("""
+                SELECT items.name, sales.amount_expected, sales.address_used, sales.created_at, sales.user_id, items.id
+                FROM sales 
+                JOIN items ON sales.item_id = items.id 
+                WHERE sales.id = ?
+            """, (sale_id,)) as cursor:
+                sale_data = await cursor.fetchone()
+                
+        if not sale_data:
+            await callback.message.edit_text("Comanda nu a fost găsită.")
+            return
+            
+        item_name, price, address, created_at, db_user_id, item_id = sale_data
+        
+        # Expiry Check
+        from datetime import datetime, timedelta
+        created_dt = datetime.strptime(created_at, '%Y-%m-%d %H:%M:%S')
+        expiry_dt = created_dt + timedelta(minutes=DEPOSIT_TIMEOUT_MINUTES)
+        if datetime.now() > expiry_dt:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE sales SET status = 'cancelled' WHERE id = ?", (sale_id,))
+                await db.execute("UPDATE addresses SET in_use_by_sale_id = NULL, locked_until = NULL WHERE in_use_by_sale_id = ?", (sale_id,))
+                await db.commit()
+            await callback.message.edit_text("⚠️ Această comandă a expirat și a fost anulată automat.")
+            await callback.answer()
+            return
+
+        ts = int(created_dt.timestamp())
+
+        async def update_status(text, kb=None):
+            try:
+                if callback.message.photo:
+                    await callback.message.edit_caption(caption=text, reply_markup=kb)
+                else:
+                    await callback.message.edit_text(text, reply_markup=kb)
+            except Exception:
+                pass
+
+        # Initial check
+        found_tx, confs, tx_hash = await check_ltc_transaction(address, price, ts)
+        
+        if found_tx:
+            # Update to confirming as soon as TX is seen
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE sales SET status = 'confirming', tx_hash = ? WHERE id = ?", (tx_hash, sale_id))
+                await db.commit()
+
+            # User requested 5, 2, 1 sequence
+            waits = [300, 120, 60]
+            for w in waits:
+                if confs >= 3: break
+                
+                await update_status(f"🔄 <b>Tranzacție detectată!</b> (TX: <code>{tx_hash[:6]}...</code>)\n\nConfirmări: <code>{confs}/3</code>\n\nUrmătoarea verificare în {w//60} minute...")
+                await asyncio.sleep(w)
+                found_tx, new_confs, tx_hash = await check_ltc_transaction(address, price, ts)
+                if new_confs != confs:
+                    confs = new_confs
+                    await callback.message.answer(f"📈 <b>Confirmări actualizate:</b> <code>{confs}/3</code>")
+
+            # Final loop
+            retries = 5
+            while confs < 3 and found_tx and retries > 0:
+                if retries < 5: await asyncio.sleep(60)
+                found_tx, new_confs, tx_hash = await check_ltc_transaction(address, price, ts)
+                if new_confs != confs:
+                    confs = new_confs
+                    await update_status(f"🔄 <b>Confirmări: {confs}/3</b>\n\nAșteptăm livrarea...")
+                retries -= 1
+
+        if found_tx and confs >= 3:
+            async with aiosqlite.connect(DB_PATH) as db:
+                # CHECK IF TX_HASH ALREADY USED BY OTHER SALES
+                async with db.execute("SELECT id FROM sales WHERE tx_hash = ? AND id != ?", (tx_hash, sale_id)) as cursor:
+                    if await cursor.fetchone():
+                        await update_status("❌ Această tranzacție a fost deja procesată pentru o altă comandă.")
+                        return
+
+                async with db.execute("SELECT id, image_url, media_type, secret_group FROM item_images WHERE item_id = ? AND is_sold = 0 LIMIT 1", (item_id,)) as cursor:
+                    image_row = await cursor.fetchone()
+                
+                if not image_row:
+                    await update_status("⚠️ Stoc epuizat. Contactați @creierosuz pentru refund sau alt pachet.")
+                    return
+                
+                img_db_id, img_url, m_type, group_id = image_row
+                
+                # Fetch the whole bundle
+                if group_id:
+                    async with db.execute("SELECT id, image_url, media_type FROM item_images WHERE secret_group = ?", (group_id,)) as cursor:
+                        bundle_items = await cursor.fetchall()
+                else:
+                    bundle_items = [(img_db_id, img_url, m_type)]
+
+                # Mark all as sold
+                for b_id, _, _ in bundle_items:
+                    await db.execute("UPDATE item_images SET is_sold = 1 WHERE id = ?", (b_id,))
+                
+                await db.execute("UPDATE sales SET status = 'paid', amount_paid = ?, image_id = ?, tx_hash = ? WHERE id = ?", (price, img_db_id, tx_hash, sale_id))
+                await db.execute("UPDATE addresses SET in_use_by_sale_id = NULL, locked_until = NULL WHERE crypto_address = ?", (address,))
+                await db.commit()
+                
+                # Final Delivery
+                await callback.bot.send_message(db_user_id, f"🎉 <b>LIVRARE REUȘITĂ!</b>\n\nProdus: <b>{item_name}</b>\nSecretul tău:")
+                
+                for _, val, mt in bundle_items:
+                    try:
+                        if mt == 'photo': await callback.bot.send_photo(db_user_id, photo=val)
+                        elif mt == 'video': await callback.bot.send_video(db_user_id, video=val)
+                        else: await callback.bot.send_message(db_user_id, f"<code>{val}</code>")
+                    except Exception as e:
+                        await callback.bot.send_message(db_user_id, f"<code>{val}</code>")
+
+                await update_status(f"✅ PLATA CONFIRMATĂ!\nProdusul a fost trimis mai jos.")
+
+                # Notify Admin
+                for admin_id in ADMIN_IDS:
+                    try:
+                        admin_msg = (
+                            f"💰 <b>VÂNZARE FINALIZATĂ (ID: #{sale_id})</b>\n\n"
+                            f"🛍 Produs: {item_name}\n"
+                            f"💵 Sumă: <code>{price}</code> LTC\n"
+                            f"👤 Client: @{callback.from_user.username or 'N/A'} (ID: <code>{callback.from_user.id}</code>)\n"
+                            f"🔗 TXID: <code>{tx_hash}</code>\n\n"
+                            f"✅ <b>Status: LIVRAT AUTOMAT</b>"
+                        )
+                        await callback.bot.send_message(admin_id, admin_msg)
+                    except: pass
+
+        else:
+            if found_tx:
+                fail_text = f"⏳ <b>Tranzacție Detectată!</b>\n\nConfirmări actuale: <code>{confs}/3</code>\n\nBotul verifică automat în fundal. Te rugăm să reîncerci manual peste câteva minute."
+            else:
+                fail_text = (
+                    "❌ <b>PLATA NU A FOST GĂSITĂ</b>\n\n"
+                    "Asigură-te că:\n"
+                    "1. Ai trimis suma CORECTĂ (minim <code>{price}</code> LTC)\n"
+                    "2. Ai trimis la adresa CORECTĂ\n"
+                    "3. Tranzacția a fost deja inițiată în portofelul tău\n\n"
+                    "<i>Dacă crezi că este o eroare, contactează suportul.</i>"
+                )
+            
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Re-verifică", callback_data=f"verify_pay_{sale_id}")],
+                [InlineKeyboardButton(text="❌ Anulează (Manual)", callback_data=f"cancel_order_{sale_id}")]
+            ])
+            await update_status(fail_text.format(price=price), kb=kb)
+
+    finally:
+        active_verifications.discard(sale_id)
+
+@router.callback_query(F.data == "check_pending_manual")
+async def cb_check_pending_manual(callback: CallbackQuery):
+    if await check_cooldown(callback): return
+    await check_and_show_pending(callback)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("cancel_order_"))
+async def cb_cancel_order(callback: CallbackQuery):
+    if await check_cooldown(callback): return
+    sale_id = int(callback.data.split("_")[2])
     
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("""
-            SELECT items.name, sales.amount_expected, sales.address_used, sales.created_at, sales.user_id, items.id
-            FROM sales 
-            JOIN items ON sales.item_id = items.id 
-            WHERE sales.id = ?
-        """, (sale_id,)) as cursor:
-            sale_data = await cursor.fetchone()
+        async with db.execute("SELECT address_used, status FROM sales WHERE id = ?", (sale_id,)) as cursor:
+            row = await cursor.fetchone()
             
-    if not sale_data:
-        await callback.message.edit_text("Comanda nu a fost găsită.")
-        return
-        
-    item_name, price, address, created_at, db_user_id, item_id = sale_data
-    from datetime import datetime
-    ts = int(datetime.strptime(created_at, '%Y-%m-%d %H:%M:%S').timestamp())
-
-    async def update_status(text, kb=None):
-        try:
-            if callback.message.photo:
-                await callback.message.edit_caption(caption=text, reply_markup=kb)
-            else:
-                await callback.message.edit_text(text, reply_markup=kb)
-        except Exception:
-            pass
-
-    # Initial check
-    found_tx, confs, tx_hash = await check_ltc_transaction(address, price, ts)
-    
-    if found_tx:
-        # User requested 5, 2, 1 sequence
-        waits = [300, 120, 60]
-        for w in waits:
-            if confs >= 3: break
-            
-            await update_status(f"🔄 <b>Tranzacție detectată!</b> (TX: <code>{tx_hash[:6]}...</code>)\n\nConfirmări: <code>{confs}/3</code>\n\nUrmătoarea verificare în {w//60} minute...")
-            await asyncio.sleep(w)
-            found_tx, new_confs, tx_hash = await check_ltc_transaction(address, price, ts)
-            if new_confs != confs:
-                confs = new_confs
-                await callback.message.answer(f"📈 <b>Confirmări actualizate:</b> <code>{confs}/3</code>")
-
-        # Final loop
-        retries = 5
-        while confs < 3 and found_tx and retries > 0:
-            if retries < 5: await asyncio.sleep(60)
-            found_tx, new_confs, tx_hash = await check_ltc_transaction(address, price, ts)
-            if new_confs != confs:
-                confs = new_confs
-                await update_status(f"🔄 <b>Confirmări: {confs}/3</b>\n\nAșteptăm livrarea...")
-            retries -= 1
-
-    if found_tx and confs >= 3:
-        async with aiosqlite.connect(DB_PATH) as db:
-            # CHECK IF TX_HASH ALREADY USED
-            async with db.execute("SELECT id FROM sales WHERE tx_hash = ?", (tx_hash,)) as cursor:
-                if await cursor.fetchone():
-                    await update_status("❌ Această tranzacție a fost deja procesată.")
-                    return
-
-            async with db.execute("SELECT id, image_url FROM item_images WHERE item_id = ? AND is_sold = 0 LIMIT 1", (item_id,)) as cursor:
-                image_row = await cursor.fetchone()
-            
-            if not image_row:
-                await update_status("⚠️ Stoc epuizat. Contactați @creierosuz pentru refund sau alt pachet.")
-                return
-            
-            img_db_id, img_url = image_row
-            await db.execute("UPDATE item_images SET is_sold = 1 WHERE id = ?", (img_db_id,))
-            await db.execute("UPDATE sales SET status = 'paid', amount_paid = ?, image_id = ?, tx_hash = ? WHERE id = ?", (price, img_db_id, tx_hash, sale_id))
-            await db.execute("UPDATE addresses SET in_use_by_sale_id = NULL, locked_until = NULL WHERE crypto_address = ?", (address,))
+        if row and row[1] == 'pending':
+            await db.execute("UPDATE sales SET status = 'cancelled' WHERE id = ?", (sale_id,))
+            await db.execute("UPDATE addresses SET in_use_by_sale_id = NULL, locked_until = NULL WHERE crypto_address = ?", (row[0],))
             await db.commit()
-            
-            # Final Delivery
-            msg_text = f"🎉 <b>LIVRARE REUȘITĂ!</b>\n\nProdus: <b>{item_name}</b>\nSecretul tău:"
-            if img_url.startswith("http") or len(img_url) > 40:
-                await callback.bot.send_photo(callback.from_user.id, photo=img_url, caption=msg_text)
-            else:
-                await callback.bot.send_message(callback.from_user.id, f"{msg_text}\n\n<code>{img_url}</code>")
-            
-            await update_status(f"✅ PLATA CONFIRMATĂ!\nProdusul a fost trimis mai jos.")
-
-            # Notify Admin
-            for admin_id in ADMIN_IDS:
-                try:
-                    admin_msg = (
-                        f"💰 <b>VÂNZARE FINALIZATĂ (ID: #{sale_id})</b>\n\n"
-                        f"🛍 Produs: {item_name}\n"
-                        f"💵 Sumă: <code>{price}</code> LTC\n"
-                        f"👤 Client: @{callback.from_user.username or 'N/A'} (ID: <code>{callback.from_user.id}</code>)\n"
-                        f"🔗 TXID: <code>{tx_hash}</code>\n\n"
-                        f"✅ <b>Status: LIVRAT AUTOMAT</b>"
-                    )
-                    await callback.bot.send_message(admin_id, admin_msg)
-                except: pass
-
-    else:
-        if found_tx:
-            fail_text = f"⏳ <b>Detectat!</b>\n\nConfirmări actuale: <code>{confs}/3</code>\n\nTe rugăm să reîncerci peste 1-2 minute."
-        else:
-            fail_text = "❌ Plata nu a fost detectată. Asigură-te că ai trimis suma corectă."
-            
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Reîmprospătează Status", callback_data=f"verify_{sale_id}")],
-            [InlineKeyboardButton(text="🔙 Magazin", callback_data="menu_shop")]
-        ])
-        await update_status(fail_text, kb)
+            await callback.answer("Comandă anulată cu succes!", show_alert=True)
+        elif row and row[1] == 'confirming':
+            await callback.answer("⚠️ Nu poți anula o comandă care se află deja în proces de verificare!", show_alert=True)
+            return
+    
+    # Refresh to menu
+    await callback.message.delete()
+    await cb_menu_start(callback)
 
 
 

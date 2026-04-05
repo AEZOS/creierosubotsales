@@ -27,3 +27,26 @@ def generate_black_magic_image(text_code="ACCESS_REVOKED"):
     img.save(buf, format='JPEG')
     buf.seek(0)
     return buf
+
+def apply_pink_overlay(image_path_or_buf):
+    """
+    Applies a pink/magenta aesthetic overlay to an image.
+    This creates a cooler, updated look as requested.
+    """
+    try:
+        from PIL import Image
+        if isinstance(image_path_or_buf, str):
+            img = Image.open(image_path_or_buf).convert('RGB')
+        else:
+            img = Image.open(image_path_or_buf).convert('RGB')
+            
+        overlay = Image.new('RGB', img.size, color=(255, 20, 147)) # Deep Pink
+        # Use simple alpha blending for cool tint
+        img = Image.blend(img, Image.new('RGB', img.size, color=(255, 105, 180)), alpha=0.1) 
+        
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=95)
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        return image_path_or_buf

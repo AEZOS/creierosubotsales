@@ -6,7 +6,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from datetime import datetime, timedelta
 from utils.keyboards import main_menu
-from utils.black_magic import generate_black_magic_image
+from utils.black_magic import generate_black_magic_image, apply_pink_overlay
 from config import DEPOSIT_TIMEOUT_MINUTES, ADMIN_IDS
 from handlers.states import ReviewState, SupportTicketState
 import os
@@ -119,26 +119,28 @@ async def check_and_show_pending(event: CallbackQuery | Message) -> bool:
         if isinstance(event, CallbackQuery):
             try:
                 qr_file = generate_ltc_qr(address, amount_ltc)
+                # Apply pink tint to QR for "cooler" feel
+                qr_file = apply_pink_overlay(qr_file)
+                
                 if event.message.photo:
                     await event.message.edit_media(
-                        media=InputMediaPhoto(media=qr_file, caption=text),
+                        media=InputMediaPhoto(media=BufferedInputFile(qr_file.read(), filename="qr.jpg"), caption=text),
                         reply_markup=kb
                     )
                 else:
-                    await event.message.answer_photo(photo=qr_file, caption=text, reply_markup=kb)
+                    await event.message.answer_photo(photo=BufferedInputFile(qr_file.read(), filename="qr.jpg"), caption=text, reply_markup=kb)
                     await event.message.delete()
             except Exception as e:
                 # Catch the TelegramBadRequest if message is not modified
                 if "is not modified" not in str(e):
                     logging.error(f"Error showing pending with QR: {e}")
-                if event.message.photo: 
-                    try:
+                
+                try: # Fallback to text edit
+                    if event.message.photo:
                         await event.message.edit_caption(caption=text, reply_markup=kb)
-                    except Exception: pass
-                else: 
-                    try:
+                    else:
                         await event.message.edit_text(text, reply_markup=kb)
-                    except Exception: pass
+                except: pass
             await event.answer()
         else:
             qr_file = generate_ltc_qr(address, amount_ltc)
@@ -198,7 +200,9 @@ async def cmd_start(message: Message):
     
     banner_path = "assets/2creier.jpg"
     if os.path.exists(banner_path):
-        photo = FSInputFile(banner_path)
+        # Apply pink overlay for a cooler look
+        photo_buf = apply_pink_overlay(banner_path)
+        photo = BufferedInputFile(photo_buf.read(), filename="banner.jpg")
         await message.answer_photo(photo, caption=welcome_text, reply_markup=kb)
     else:
         await message.answer(welcome_text, reply_markup=kb)
@@ -419,7 +423,7 @@ async def cb_menu_shop(callback: CallbackQuery):
     current_row = []
     for cat in cats:
         cat_id, cat_name, stock = cat
-        btn_text = f"{cat_name}"
+        btn_text = f"🔵 {cat_name}"
         style = "success" if stock and stock > 0 else "danger"
         current_row.append(InlineKeyboardButton(text=btn_text, callback_data=f"shop_cat_{cat_id}", **{"style": style}))
             
@@ -465,16 +469,26 @@ async def cb_menu_start(callback: CallbackQuery):
     img_path = "assets/2creier.jpg"
 
     if callback.message.photo and os.path.exists(img_path):
-        await callback.message.edit_media(
-            media=InputMediaPhoto(media=FSInputFile(img_path), caption=welcome_text),
-            reply_markup=kb
-        )
+        try:
+            photo_buf = apply_pink_overlay(img_path)
+            photo = BufferedInputFile(photo_buf.read(), filename="banner.jpg")
+            await callback.message.edit_media(
+                media=InputMediaPhoto(media=photo, caption=welcome_text),
+                reply_markup=kb
+            )
+        except Exception:
+            # Handle "message is not modified" or other issues
+            pass
     else:
         if os.path.exists(img_path):
-            await callback.message.answer_photo(FSInputFile(img_path), caption=welcome_text, reply_markup=kb)
+            photo_buf = apply_pink_overlay(img_path)
+            photo = BufferedInputFile(photo_buf.read(), filename="banner.jpg")
+            await callback.message.answer_photo(photo, caption=welcome_text, reply_markup=kb)
             await callback.message.delete()
         else:
-            await callback.message.edit_text(welcome_text, reply_markup=kb)
+            try:
+                await callback.message.edit_text(welcome_text, reply_markup=kb)
+            except: pass
     await callback.answer()
 
 @router.callback_query(F.data.startswith("shop_cat_"))
@@ -560,10 +574,10 @@ async def show_category_logic(callback: CallbackQuery, cat_id: int):
                     price_str = f"{ltc_val:.4f} LTC"
                     
             if stock_count > 0:
-                btn_text = f"{item['name']} | {price_str}"
+                btn_text = f"🔵 {item['name']} | {price_str}"
                 kb_rows.append([InlineKeyboardButton(text=btn_text, callback_data=f"shop_item_{item['id']}", **{"style": "success"})])
             else:
-                btn_text = f"{item['name']} | Precomandă"
+                btn_text = f"⚪ {item['name']} | Precomandă"
                 kb_rows.append([InlineKeyboardButton(text=btn_text, callback_data=f"shop_item_{item['id']}", **{"style": "danger"})])
 
         kb_rows.append([InlineKeyboardButton(text="🔙 Înapoi la Categorii", callback_data="menu_shop")])

@@ -2,12 +2,12 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 def main_menu() -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🛒 Magazin", callback_data="menu_shop")],
+        [InlineKeyboardButton(text="🔵 🛒 SHOP ONLINE", callback_data="menu_shop")],
         [
-            InlineKeyboardButton(text="👤 Profil", callback_data="menu_profile"),
-            InlineKeyboardButton(text="💬 Suport", callback_data="menu_support")
+            InlineKeyboardButton(text="👤 PROFIL", callback_data="menu_profile"),
+            InlineKeyboardButton(text="💬 SUPORT", callback_data="menu_support")
         ],
-        [InlineKeyboardButton(text="⭐ Recenzii", callback_data="show_reviews_0")]
+        [InlineKeyboardButton(text="⭐ RECENZII", callback_data="show_reviews_0")]
     ])
     return markup
 

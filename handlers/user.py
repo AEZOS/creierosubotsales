@@ -20,6 +20,35 @@ import time
 
 router = Router()
 
+# --- INVENTORY CACHE ---
+# This ensures that even if DB is busy or internet is slow, 
+# navigation remains 'live' and snappy.
+inventory_cache = {
+    "categories": [],
+    "items": {},
+    "last_update": 0
+}
+
+async def update_inventory_cache():
+    """Periodically refresh the inventory cache from DB."""
+    global inventory_cache
+    now = time.time()
+    if now - inventory_cache["last_update"] < 300: # 5 minute TTL
+        return
+        
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM categories WHERE is_hidden = 0") as cursor:
+                inventory_cache["categories"] = [dict(r) for r in await cursor.fetchall()]
+            async with db.execute("SELECT * FROM items WHERE is_hidden = 0") as cursor:
+                items_list = [dict(r) for r in await cursor.fetchall()]
+                inventory_cache["items"] = {i['id']: i for i in items_list}
+            inventory_cache["last_update"] = now
+            logging.info("Inventory cache updated.")
+    except Exception as e:
+        logging.error(f"Failed to update inventory cache: {e}")
+
 # Cooldown for buttons (Anti-spam)
 button_cooldowns = {}  # (user_id, callback_data) -> last_press_time
 BOT_START_TIME = time.time()
@@ -306,6 +335,16 @@ async def cb_view_order_secret(callback: CallbackQuery):
 
     for val, m_type, capt in contents:
         try:
+            # Special check for 'encrypted' (stale) data from migration
+            if isinstance(val, str) and "🔐 [ENCRYPTED-DATA" in val:
+                enc_banner = (
+                    "🔐 <b>ENCRYPTED PACKAGE DETECTED</b>\n\n"
+                    f"<code>{val}</code>\n\n"
+                    "<i>Acest pachet a fost securizat în timpul migrării botului. Toate datele noi (stocul proaspăt) vor fi livrate direct ca imagini sau videoclipuri premium conform instrucțiunilor vânzătorului.</i>"
+                )
+                await callback.bot.send_message(user_tg_id, enc_banner)
+                continue
+
             if m_type == 'photo':
                 await callback.bot.send_photo(user_tg_id, photo=val, caption=capt)
             elif m_type == 'video':
@@ -314,7 +353,7 @@ async def cb_view_order_secret(callback: CallbackQuery):
                 await callback.bot.send_message(user_tg_id, f"<code>{val}</code>")
         except Exception as e:
             logging.error(f"Error sending secret to user: {e}")
-            await callback.bot.send_message(user_tg_id, f"<code>{val}</code>")
+            await callback.bot.send_message(user_tg_id, f"⚠️ <i>Conținut indisponibil (File Reference Stale)</i>\n\n<code>{val}</code>")
         
     await callback.answer("Ți-am retrimis mesajele cu stocul!", show_alert=True)
 

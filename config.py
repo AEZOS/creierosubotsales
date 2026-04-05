@@ -14,7 +14,7 @@ LTC_ADDRESSES = [addr.strip() for addr in os.getenv("LTC_ADDRESSES", "").split("
 DEPOSIT_TIMEOUT_MINUTES = 30
 
 # SQLite Database path for persistence
-DB_PATH = os.getenv("DB_PATH", "bot_database.sqlite")
+DB_PATH = os.path.abspath(os.getenv("DB_PATH", "bot_database.sqlite"))
 
 # Assets directory for persistence
 ASSETS_DIR = os.getenv("ASSETS_DIR", "assets")

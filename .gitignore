@@ -11,3 +11,16 @@ tmp_unzip/
 *.rar
 *.exe
 assets/stock_*
+
+# User request: Ignore secondary bots and scripts
+mogosu/
+a1_z1_c1_2c2/
+tmp/*.py
+find_*.py
+check_*.py
+seed_*.py
+download_*.py
+migration_*.py
+export_*.py
+get_*.py
+*.log

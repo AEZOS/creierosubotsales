@@ -2,7 +2,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 def main_menu() -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔵 🛒 SHOP ONLINE", callback_data="menu_shop")],
+        [InlineKeyboardButton(text="🛒 MAGAZIN", callback_data="menu_shop")],
         [
             InlineKeyboardButton(text="👤 PROFIL", callback_data="menu_profile"),
             InlineKeyboardButton(text="💬 SUPORT", callback_data="menu_support")

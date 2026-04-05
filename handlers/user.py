@@ -423,7 +423,7 @@ async def cb_menu_shop(callback: CallbackQuery):
     current_row = []
     for cat in cats:
         cat_id, cat_name, stock = cat
-        btn_text = f"🔵 {cat_name}"
+        btn_text = f"{cat_name}"
         style = "success" if stock and stock > 0 else "danger"
         current_row.append(InlineKeyboardButton(text=btn_text, callback_data=f"shop_cat_{cat_id}", **{"style": style}))
             
@@ -574,10 +574,10 @@ async def show_category_logic(callback: CallbackQuery, cat_id: int):
                     price_str = f"{ltc_val:.4f} LTC"
                     
             if stock_count > 0:
-                btn_text = f"🔵 {item['name']} | {price_str}"
+                btn_text = f"{item['name']} | {price_str}"
                 kb_rows.append([InlineKeyboardButton(text=btn_text, callback_data=f"shop_item_{item['id']}", **{"style": "success"})])
             else:
-                btn_text = f"⚪ {item['name']} | Precomandă"
+                btn_text = f"{item['name']} | Precomandă"
                 kb_rows.append([InlineKeyboardButton(text=btn_text, callback_data=f"shop_item_{item['id']}", **{"style": "danger"})])
 
         kb_rows.append([InlineKeyboardButton(text="🔙 Înapoi la Categorii", callback_data="menu_shop")])

@@ -28,6 +28,12 @@ async def main():
     
     dp.include_router(admin_router)
     dp.include_router(user_router)
+
+    # Fixed global error handler signature for aiogram 3.x
+    @dp.errors()
+    async def global_error_handler(event):
+        logging.error(f"Global Update Error: {event.exception}")
+        return True # Swallow exception to keep bot alive
     
     # Start polling
     logging.info("Starting bot...")

@@ -161,6 +161,12 @@ async def start_bot():
     dp.include_router(admin_router)
     dp.include_router(user_router)
 
+    # Fixed global error handler signature for aiogram 3.x
+    @dp.errors()
+    async def global_error_handler(event):
+        logging.error(f"Global Update Error: {event.exception}")
+        return True # Swallow exception to keep bot alive
+
     await bot.delete_webhook(drop_pending_updates=True)
     logging.info("🚀 Telegram Bot starting...")
     await dp.start_polling(bot)

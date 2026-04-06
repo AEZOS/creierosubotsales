@@ -1,3 +1,12 @@
+---
+title: Creierbot
+emoji: 🐳
+colorFrom: pink
+colorTo: indigo
+sdk: docker
+app_port: 7860
+---
+
 # 🚀 Creierosu Bot
 
 A powerful Telegram bot with a FastAPI Sales Dashboard.

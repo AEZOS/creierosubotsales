@@ -12,6 +12,7 @@ from handlers.states import ReviewState, SupportTicketState
 import os
 from utils.tatum import check_ltc_transaction
 from utils.ltc_price import get_ltc_ron_price, ron_to_ltc
+from utils.ui import smart_edit
 import aiosqlite
 import logging
 import asyncio
@@ -136,10 +137,7 @@ async def check_and_show_pending(event: CallbackQuery | Message) -> bool:
                     logging.error(f"Error showing pending with QR: {e}")
                 
                 try: # Fallback to text edit
-                    if event.message.photo:
-                        await event.message.edit_caption(caption=text, reply_markup=kb)
-                    else:
-                        await event.message.edit_text(text, reply_markup=kb)
+                    await smart_edit(event, text, reply_markup=kb)
                 except: pass
             await event.answer()
         else:
@@ -296,11 +294,7 @@ async def cb_menu_profile(callback: CallbackQuery):
             await callback.message.answer_photo(photo, caption=text, reply_markup=kb)
             await callback.message.delete()
     else:
-        if callback.message.photo:
-            await callback.message.delete()
-            await callback.message.answer(text, reply_markup=kb)
-        else:
-            await callback.message.edit_text(text, reply_markup=kb)
+        await smart_edit(callback, text, reply_markup=kb)
     await callback.answer()
 
 @router.callback_query(F.data.startswith("view_secret_"))
@@ -387,11 +381,7 @@ async def cb_menu_support(callback: CallbackQuery):
             await callback.message.answer_photo(photo, caption=text, reply_markup=kb)
             await callback.message.delete()
     else:
-        if callback.message.photo:
-            await callback.message.delete()
-            await callback.message.answer(text, reply_markup=kb)
-        else:
-            await callback.message.edit_text(text, reply_markup=kb)
+        await smart_edit(callback, text, reply_markup=kb)
     await callback.answer()
 
 @router.callback_query(F.data == "menu_shop")
@@ -415,7 +405,7 @@ async def cb_menu_shop(callback: CallbackQuery):
             cats = await cursor.fetchall()
             
     if not cats:
-        await callback.message.edit_text("Momentan nu există categorii disponibile.")
+        await smart_edit(callback, "Momentan nu există categorii disponibile.")
         await callback.answer()
         return
 
@@ -449,11 +439,7 @@ async def cb_menu_shop(callback: CallbackQuery):
             await callback.message.answer_photo(photo, caption=label, reply_markup=kb)
             await callback.message.delete()
     else:
-        if callback.message.photo:
-            await callback.message.delete()
-            await callback.message.answer(label, reply_markup=kb)
-        else:
-            await callback.message.edit_text(label, reply_markup=kb)
+        await smart_edit(callback, label, reply_markup=kb)
     await callback.answer()
 
 @router.callback_query(F.data == "menu_start")
@@ -480,15 +466,7 @@ async def cb_menu_start(callback: CallbackQuery):
             # Handle "message is not modified" or other issues
             pass
     else:
-        if os.path.exists(img_path):
-            photo_buf = apply_pink_overlay(img_path)
-            photo = BufferedInputFile(photo_buf.read(), filename="banner.jpg")
-            await callback.message.answer_photo(photo, caption=welcome_text, reply_markup=kb)
-            await callback.message.delete()
-        else:
-            try:
-                await callback.message.edit_text(welcome_text, reply_markup=kb)
-            except: pass
+        await smart_edit(callback, welcome_text, reply_markup=kb)
     await callback.answer()
 
 @router.callback_query(F.data.startswith("shop_cat_"))
@@ -597,11 +575,7 @@ async def show_category_logic(callback: CallbackQuery, cat_id: int):
             await callback.message.answer_photo(photo, caption=text, reply_markup=kb)
             await callback.message.delete()
     else:
-        if callback.message.photo:
-            await callback.message.delete()
-            await callback.message.answer(text, reply_markup=kb)
-        else:
-            await callback.message.edit_text(text, reply_markup=kb)
+        await smart_edit(callback, text, reply_markup=kb)
     await callback.answer()
 
 @router.callback_query(F.data.startswith("shop_item_"))
@@ -664,11 +638,7 @@ async def cb_shop_item(callback: CallbackQuery):
             await callback.message.answer_photo(photo, caption=text, reply_markup=kb)
             await callback.message.delete()
     else:
-        if callback.message.photo:
-            await callback.message.delete()
-            await callback.message.answer(text, reply_markup=kb)
-        else:
-            await callback.message.edit_text(text, reply_markup=kb)
+        await smart_edit(callback, text, reply_markup=kb)
     await callback.answer()
 
 @router.callback_query(F.data.startswith("nav_back_cat_"))
@@ -864,7 +834,7 @@ async def cb_verify_payment(callback: CallbackQuery):
     if callback.message.photo:
         await callback.message.edit_caption(caption=label, reply_markup=None)
     else:
-        await callback.message.edit_text(label, reply_markup=None)
+        await smart_edit(callback, label, reply_markup=None)
     await callback.answer()
 
     active_verifications.add(sale_id)
@@ -911,7 +881,7 @@ async def cb_verify_payment(callback: CallbackQuery):
                 await db.execute("UPDATE sales SET status = 'cancelled' WHERE id = ?", (sale_id,))
                 await db.execute("UPDATE addresses SET in_use_by_sale_id = NULL, locked_until = ? WHERE in_use_by_sale_id = ?", (cooldown_str, sale_id))
                 await db.commit()
-            await callback.message.edit_text("⚠️ Această comandă a expirat și a fost anulată automat.")
+            await smart_edit(callback, "⚠️ Această comandă a expirat și a fost anulată automat.")
             await callback.answer()
             return
 
@@ -923,7 +893,7 @@ async def cb_verify_payment(callback: CallbackQuery):
                 if callback.message.photo:
                     await callback.message.edit_caption(caption=text, reply_markup=kb)
                 else:
-                    await callback.message.edit_text(text, reply_markup=kb)
+                    await smart_edit(callback, text, reply_markup=kb)
             except Exception:
                 pass
 
@@ -1312,7 +1282,7 @@ async def show_reviews(callback: CallbackQuery):
     if callback.message.photo:
         await callback.message.edit_caption(caption=text, reply_markup=kb)
     else:
-        await callback.message.edit_text(text, reply_markup=kb)
+        await smart_edit(callback, text, reply_markup=kb)
     await callback.answer()
 
 @router.callback_query(F.data.startswith("write_rev_"))
@@ -1344,7 +1314,7 @@ async def process_rating(callback: CallbackQuery, state: FSMContext):
     await state.update_data(rating=rating)
     await state.set_state(ReviewState.wait_comment)
     stars = "⭐" * rating
-    await callback.message.edit_text(f"{stars} Notă: <b>{rating}/5</b>\n\nScrie un comentariu scurt (max 500 car.):\n<i>Sau trimite '-' pentru a sări peste comentariu.</i>")
+    await smart_edit(callback, f"{stars} Notă: <b>{rating}/5</b>\n\nScrie un comentariu scurt (max 500 car.):\n<i>Sau trimite '-' pentru a sări peste comentariu.</i>")
     await callback.answer()
 
 @router.message(ReviewState.wait_comment)
@@ -1400,7 +1370,7 @@ async def cb_user_preo_valid_confirm(callback: CallbackQuery):
             await db.execute("UPDATE preorders SET status = 'confirmed' WHERE id = ?", (preo_id,))
             await db.commit()
             
-        await callback.message.edit_text("✅ <b>Ai confirmat că dorești produsul!</b>\n\nVânzătorul a fost notificat și va reveni cu un timp estimat de livrare.")
+        await smart_edit(callback, "✅ <b>Ai confirmat că dorești produsul!</b>\n\nVânzătorul a fost notificat și va reveni cu un timp estimat de livrare.")
         
         # Notify Admin
         from config import ADMIN_IDS
@@ -1419,7 +1389,7 @@ async def cb_user_preo_valid_confirm(callback: CallbackQuery):
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("DELETE FROM preorders WHERE id = ?", (preo_id,))
             await db.commit()
-        await callback.message.edit_text("❌ <b>Precomandă anulată.</b>\n\nMulțumim!")
+        await smart_edit(callback, "❌ <b>Precomandă anulată.</b>\n\nMulțumim!")
     
     await callback.answer()
 

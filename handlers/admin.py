@@ -8,6 +8,7 @@ from aiogram.fsm.context import FSMContext
 from handlers.states import AdminCategory, AdminItem, AdminStock, AdminRemoval, AdminAddress, AdminPreorder, AdminReplyState
 from database import DB_PATH, is_silent_mode, set_silent_mode, get_last_completed_sales, restore_secret_and_delete_sale, get_item_stats, get_user_total_sales, is_blackmagic_on, set_blackmagic
 from utils.image_cleaner import strip_exif
+from utils.ui import smart_edit
 import aiosqlite
 import logging
 import io
@@ -23,17 +24,7 @@ router = Router()
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-async def smart_edit(message: Message, text: str, reply_markup: InlineKeyboardMarkup = None):
-    if message.photo:
-        try: await message.delete()
-        except: pass
-        return await message.answer(text, reply_markup=reply_markup)
-    else:
-        try:
-            return await message.edit_text(text, reply_markup=reply_markup)
-        except Exception as e:
-            if "is not modified" in str(e): return
-            return await message.answer(text, reply_markup=reply_markup)
+# smart_edit removed, now using utils.ui.smart_edit
 
 @router.message(Command("check"))
 async def cmd_check_slots(message: Message):
@@ -95,7 +86,7 @@ async def cmd_silent_toggle(message: Message):
 async def cb_silent_off(callback: CallbackQuery):
     if not is_admin(callback.from_user.id): return
     await set_silent_mode(False)
-    await callback.message.edit_text("🔔 <b>SILENT MODE DEZACTIVAT</b>\n\nToți adminii primesc acum notificări.")
+    await smart_edit(callback, "🔔 <b>SILENT MODE DEZACTIVAT</b>\n\nToți adminii primesc acum notificări.")
     await callback.answer()
 
 @router.message(Command("blackmagic"))
@@ -226,7 +217,7 @@ async def cb_admin_preo_list(callback: CallbackQuery):
     rows = rows[:limit]
     
     if not rows and page == 0:
-        return await callback.message.edit_text("📭 Nu există precomenzi active.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Înapoi", callback_data="admin_main")]]))
+        return await smart_edit(callback, "📭 Nu există precomenzi active.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Înapoi", callback_data="admin_main")]]))
         
     text = f"📥 <b>GESTIUNE PRECOMENZI (Pagina {page+1})</b>\n\n"
     kb_rows = []
@@ -842,7 +833,7 @@ async def cb_admin_stats(callback: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     
     try:
-        await callback.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+        await smart_edit(callback, text, reply_markup=kb, disable_web_page_preview=True)
     except:
         pass
     await callback.answer()
@@ -962,7 +953,7 @@ async def cb_del_secret(callback: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM item_images WHERE secret_group = ?", (s_id,))
         await db.commit()
-    await callback.message.edit_text(f"✅ Pachetul <code>{s_id}</code> a fost șters.")
+    await smart_edit(callback, f"✅ Pachetul <code>{s_id}</code> a fost șters.")
     await callback.answer("Pachet șters!", show_alert=True)
 
 @router.callback_query(F.data.startswith("adm_view_r_"))
@@ -992,7 +983,7 @@ async def cb_del_single_secret(callback: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM item_images WHERE id = ?", (raw_id,))
         await db.commit()
-    await callback.message.edit_text(f"✅ Elementul individual <code>{raw_id}</code> a fost șters.")
+    await smart_edit(callback, f"✅ Elementul individual <code>{raw_id}</code> a fost șters.")
     await callback.answer("Șters!", show_alert=True)
 
 @router.callback_query(F.data.startswith("adm_appr_"))
@@ -1125,7 +1116,7 @@ async def cb_admin_approve(callback: CallbackQuery):
             if callback.message.photo:
                 await callback.message.edit_caption(caption=success_msg)
             else:
-                await callback.message.edit_text(text=success_msg)
+                await smart_edit(callback, text=success_msg)
                 
         except Exception as e:
             try: await db.execute("ROLLBACK")
@@ -1151,7 +1142,7 @@ async def cb_admin_cancel_sale(callback: CallbackQuery):
         if callback.message.photo:
             await callback.message.edit_caption(caption=cancel_label)
         else:
-            await callback.message.edit_text(cancel_label)
+            await smart_edit(callback, cancel_label)
     except: pass
     await callback.answer("Comandă anulată.")
 
@@ -1199,7 +1190,7 @@ async def cb_preorder_decision(callback: CallbackQuery):
     if callback.message.photo:
         await callback.message.edit_caption(caption=status_text)
     else:
-        await callback.message.edit_text(status_text)
+        await smart_edit(callback, status_text)
         
     await callback.answer()
 
@@ -1227,7 +1218,7 @@ async def cb_admin_main(callback: CallbackQuery, state: FSMContext):
             await callback.message.answer_photo(FSInputFile(img_path), caption=text, reply_markup=admin_main_menu())
             await callback.message.delete()
         else:
-            await callback.message.edit_text(text, reply_markup=admin_main_menu())
+            await smart_edit(callback, text, reply_markup=admin_main_menu())
     await callback.answer()
 
 
@@ -1250,7 +1241,7 @@ async def cb_admin_actions(callback: CallbackQuery, state: FSMContext):
     if action == "cats":
         label = "Trimite **Emoji-ul** pentru noua categorie (Ex: ❄️):"
         if callback.message.photo: await callback.message.edit_caption(caption=label)
-        else: await callback.message.edit_text(label)
+        else: await smart_edit(callback, label)
         await state.set_state(AdminCategory.waiting_for_name)
         
     elif action == "items":
@@ -1264,7 +1255,7 @@ async def cb_admin_actions(callback: CallbackQuery, state: FSMContext):
         kb.inline_keyboard.append([InlineKeyboardButton(text="❌ Anulare", callback_data="admin_main")])
         label = "Selectați categoria pentru noul produs:"
         if callback.message.photo: await callback.message.edit_caption(caption=label, reply_markup=kb)
-        else: await callback.message.edit_text(label, reply_markup=kb)
+        else: await smart_edit(callback, label, reply_markup=kb)
         await state.set_state(AdminItem.waiting_for_category)
         
     elif action == "stock":
@@ -1278,7 +1269,7 @@ async def cb_admin_actions(callback: CallbackQuery, state: FSMContext):
         kb.inline_keyboard.append([InlineKeyboardButton(text="❌ Anulare", callback_data="admin_main")])
         label = "📦 <b>Adăugare Stoc</b>\nSelectați categoria din care face parte produsul:"
         if callback.message.photo: await callback.message.edit_caption(caption=label, reply_markup=kb)
-        else: await callback.message.edit_text(label, reply_markup=kb)
+        else: await smart_edit(callback, label, reply_markup=kb)
         # state is NOT set here yet, we wait for as_cat_...
         
     elif action == "pending":
@@ -1379,7 +1370,7 @@ async def cb_admin_actions(callback: CallbackQuery, state: FSMContext):
         kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
         
         if callback.message.photo: await callback.message.edit_caption(caption=text, reply_markup=kb)
-        else: await callback.message.edit_text(text, reply_markup=kb)
+        else: await smart_edit(callback, text, reply_markup=kb)
 
     elif action == "cancelled":
         async with aiosqlite.connect(DB_PATH) as db:
@@ -1414,7 +1405,7 @@ async def cb_admin_actions(callback: CallbackQuery, state: FSMContext):
         kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
         
         if callback.message.photo: await callback.message.edit_caption(caption=text, reply_markup=kb)
-        else: await callback.message.edit_text(text, reply_markup=kb)
+        else: await smart_edit(callback, text, reply_markup=kb)
 
     elif action == "preorders":
         async with aiosqlite.connect(DB_PATH) as db:
@@ -1450,7 +1441,7 @@ async def cb_admin_actions(callback: CallbackQuery, state: FSMContext):
         kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
         
         if callback.message.photo: await callback.message.edit_caption(caption=text, reply_markup=kb)
-        else: await callback.message.edit_text(text, reply_markup=kb)
+        else: await smart_edit(callback, text, reply_markup=kb)
 
     elif action == "addresses":
         async with aiosqlite.connect(DB_PATH) as db:
@@ -1474,7 +1465,7 @@ async def cb_admin_actions(callback: CallbackQuery, state: FSMContext):
         
         label = "💳 <b>Gestiune Sloturi Adrese LTC</b>\nApasă pe un slot pentru a schimba adresa."
         if callback.message.photo: await callback.message.edit_caption(caption=label, reply_markup=kb)
-        else: await callback.message.edit_text(label, reply_markup=kb)
+        else: await smart_edit(callback, label, reply_markup=kb)
         await callback.answer()
 
     # --- REMOVE ACTIONS ---
@@ -1508,7 +1499,7 @@ async def cb_admin_actions(callback: CallbackQuery, state: FSMContext):
             
             kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Înapoi", callback_data="admin_main")])
             if callback.message.photo: await callback.message.edit_caption(caption=label, reply_markup=kb)
-            else: await callback.message.edit_text(label, reply_markup=kb)
+            else: await smart_edit(callback, label, reply_markup=kb)
             
     await callback.answer()
 
@@ -1573,7 +1564,7 @@ async def cb_stock_cat(callback: CallbackQuery, state: FSMContext):
     
     text = f"📦 <b>Produse în Categorie</b>\nSelectați produsul pentru stoc:"
     if callback.message.photo: await callback.message.edit_caption(caption=text, reply_markup=kb)
-    else: await callback.message.edit_text(text, reply_markup=kb)
+    else: await smart_edit(callback, text, reply_markup=kb)
     await state.set_state(AdminStock.waiting_for_item)
     await callback.answer()
 
@@ -1639,7 +1630,7 @@ async def process_item_category(callback: CallbackQuery, state: FSMContext):
     await state.update_data(cat_id=cat_id)
     label = "Trimite numele produsului (Ex: 1x❄️ = 500 RON):"
     if callback.message.photo: await callback.message.edit_caption(caption=label)
-    else: await callback.message.edit_text(label)
+    else: await smart_edit(callback, label)
     await state.set_state(AdminItem.waiting_for_name)
     await callback.answer()
 
@@ -1725,7 +1716,7 @@ async def process_stock_item(callback: CallbackQuery, state: FSMContext):
     ])
 
     if callback.message.photo: await callback.message.edit_caption(caption=label, reply_markup=kb)
-    else: await callback.message.edit_text(label, reply_markup=kb)
+    else: await smart_edit(callback, label, reply_markup=kb)
     await state.set_state(AdminStock.waiting_for_bundle)
     await callback.answer()
 
@@ -1901,7 +1892,7 @@ async def cb_edit_slot(callback: CallbackQuery, state: FSMContext):
         if callback.message.photo:
             await callback.message.edit_caption(caption=label, reply_markup=kb)
         else:
-            await callback.message.edit_text(label, reply_markup=kb)
+            await smart_edit(callback, label, reply_markup=kb)
     else:
         label = (
             f"📝 <b>Slot #{slot_id}</b>\n\n"

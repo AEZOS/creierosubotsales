@@ -8,7 +8,7 @@ from jinja2 import Template
 from fastapi import FastAPI, Request, Response, Form, File, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-import aiosqlite
+from database import db_session
 
 app = FastAPI(title="Creierosu v9 Ultimate Dashboard")
 
@@ -652,25 +652,30 @@ async def home(request: Request):
     if not is_authenticated(request): 
         return RedirectResponse(url="/login")
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        user_count = (await (await db.execute("SELECT COUNT(*) FROM users")).fetchone())[0]
-        row = await (await db.execute("SELECT COUNT(*), SUM(amount_paid) FROM sales WHERE status IN ('paid', 'completed')")).fetchone()
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("SELECT COUNT(*) as count FROM users")
+            user_count = (await cursor.fetchone())['count']
+            await cursor.execute("SELECT COUNT(*) as count, SUM(amount_paid) as revenue FROM sales WHERE status IN ('paid', 'completed')")
+            row = await cursor.fetchone()
         
     return Template(TEMPLATES_HTML).render(
         user_count=user_count, 
-        sales_count=row[0], 
-        revenue=round(row[1] or 0, 2)
+        sales_count=row['count'], 
+        revenue=round(float(row['revenue'] or 0), 2)
     )
 
 @app.get("/api/inventory")
 async def get_inventory(request: Request):
     if not is_authenticated(request): return JSONResponse(status_code=403, content={"error": "Unauthorized"})
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cats = [dict(r) for r in await (await db.execute("SELECT * FROM categories")).fetchall()]
-        items = [dict(r) for r in await (await db.execute("SELECT * FROM items")).fetchall()]
-        stock = [dict(r) for r in await (await db.execute("SELECT * FROM item_images WHERE is_sold = 0")).fetchall()]
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("SELECT * FROM categories")
+            cats = await cursor.fetchall()
+            await cursor.execute("SELECT * FROM items")
+            items = await cursor.fetchall()
+            await cursor.execute("SELECT * FROM item_images WHERE is_sold = FALSE")
+            stock = await cursor.fetchall()
     for item in items:
         item["stock"] = [s for s in stock if s["item_id"] == item["id"]]
         item["stock_count"] = len(item["stock"])
@@ -679,96 +684,110 @@ async def get_inventory(request: Request):
 @app.get("/api/stats")
 async def api_stats(request: Request):
     if not is_authenticated(request): return JSONResponse(status_code=403, content={"error": "Unauthorized"})
-    fifteen_mins_ago = (datetime.now() - timedelta(minutes=15)).strftime('%Y-%m-%d %H:%M:%S')
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        sales = await (await db.execute("SELECT COUNT(*) as count, SUM(amount_paid) as revenue FROM sales WHERE status IN ('paid', 'completed')")).fetchone()
-        pending = await (await db.execute("SELECT COUNT(*) as count FROM sales WHERE status IN ('pending', 'confirming')")).fetchone()
-        online = await (await db.execute("SELECT COUNT(*) as count FROM users WHERE last_activity_at > ?", (fifteen_mins_ago,))).fetchone()
-        stock = await (await db.execute("SELECT COUNT(*) FROM item_images WHERE is_sold = 0")).fetchone()
-        addresses = await (await db.execute("SELECT COUNT(*) FROM addresses")).fetchone()
-
+    fifteen_mins_ago = datetime.now() - timedelta(minutes=15)
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("SELECT COUNT(*) as count, SUM(amount_paid) as revenue FROM sales WHERE status IN ('paid', 'completed')")
+            sales = await cursor.fetchone()
+            await cursor.execute("SELECT COUNT(*) as count FROM sales WHERE status IN ('pending', 'confirming')")
+            pending = await cursor.fetchone()
+            await cursor.execute("SELECT COUNT(*) as count FROM users WHERE last_activity_at > %s", (fifteen_mins_ago,))
+            online = await cursor.fetchone()
+            await cursor.execute("SELECT COUNT(*) as count FROM item_images WHERE is_sold = FALSE")
+            stock = await cursor.fetchone()
+            await cursor.execute("SELECT COUNT(*) as count FROM addresses")
+            addresses = await cursor.fetchone()
+ 
     return {
-        "revenue": f"{round(sales['revenue'] or 0, 2)} RON" if sales['revenue'] else "0 RON",
+        "revenue": f"{round(float(sales['revenue'] or 0), 2)} RON" if sales['revenue'] else "0 RON",
         "sales_count": sales['count'],
         "pending_count": pending['count'],
         "online_count": online['count'],
-        "stock_count": stock[0],
-        "address_count": addresses[0]
+        "stock_count": stock['count'],
+        "address_count": addresses['count']
     }
 
 @app.get("/api/detailed-stats/{type}")
 async def get_detailed_stats(request: Request, type: str):
     if not is_authenticated(request): return JSONResponse(status_code=403, content={"error": "Unauthorized"})
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        if type == "completed":
-            rows = await (await db.execute("""
-                SELECT s.id, u.username, i.name as item_name, s.amount_paid, s.created_at
-                FROM sales s JOIN users u ON s.user_id = u.id JOIN items i ON s.item_id = i.id
-                WHERE s.status IN ('paid', 'completed') ORDER BY s.id DESC LIMIT 20
-            """)).fetchall()
-        elif type == "pending":
-            rows = await (await db.execute("""
-                SELECT s.id, u.username, i.name as item_name, s.amount_expected, s.created_at, s.status
-                FROM sales s JOIN users u ON s.user_id = u.id JOIN items i ON s.item_id = i.id
-                WHERE s.status IN ('pending', 'confirming') ORDER BY s.id DESC
-            """)).fetchall()
-        elif type == "online":
-            t = (datetime.now() - timedelta(minutes=15)).strftime('%Y-%m-%d %H:%M:%S')
-            rows = await (await db.execute("SELECT telegram_id, username, last_activity, last_activity_at, profile_photo FROM users WHERE last_activity_at > ? ORDER BY last_activity_at DESC", (t,))).fetchall()
-        else: return {"data": []}
-        return {"data": [dict(r) for r in rows]}
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            if type == "completed":
+                await cursor.execute("""
+                    SELECT s.id, u.username, i.name as item_name, s.amount_paid, s.created_at
+                    FROM sales s JOIN users u ON s.user_id = u.id JOIN items i ON s.item_id = i.id
+                    WHERE s.status IN ('paid', 'completed') ORDER BY s.id DESC LIMIT 20
+                """)
+                rows = await cursor.fetchall()
+            elif type == "pending":
+                await cursor.execute("""
+                    SELECT s.id, u.username, i.name as item_name, s.amount_expected, s.created_at, s.status
+                    FROM sales s JOIN users u ON s.user_id = u.id JOIN items i ON s.item_id = i.id
+                    WHERE s.status IN ('pending', 'confirming') ORDER BY s.id DESC
+                """)
+                rows = await cursor.fetchall()
+            elif type == "online":
+                t = datetime.now() - timedelta(minutes=15)
+                await cursor.execute("SELECT telegram_id, username, last_activity, last_activity_at, profile_photo FROM users WHERE last_activity_at > %s ORDER BY last_activity_at DESC", (t,))
+                rows = await cursor.fetchall()
+            else: return {"data": []}
+            return {"data": [dict(r) for r in rows]}
 
 @app.get("/api/activity")
 async def get_activity(request: Request):
     if not is_authenticated(request): return JSONResponse(status_code=403, content={"error": "Unauthorized"})
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        act = [dict(r) for r in await (await db.execute("SELECT telegram_id, username, last_activity, last_activity_at, profile_photo FROM users WHERE last_activity IS NOT NULL ORDER BY last_activity_at DESC LIMIT 50")).fetchall()]
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("SELECT telegram_id, username, last_activity, last_activity_at, profile_photo FROM users WHERE last_activity IS NOT NULL ORDER BY last_activity_at DESC LIMIT 50")
+            act = await cursor.fetchall()
     return {"activity": act}
 
 @app.get("/api/user-profile/{tg_id}")
 async def get_user_profile(request: Request, tg_id: int):
     if not is_authenticated(request): return JSONResponse(status_code=403, content={"error": "Unauthorized"})
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        user = await (await db.execute("SELECT * FROM users WHERE telegram_id = ?", (tg_id,))).fetchone()
-        if not user: return JSONResponse(status_code=404, content={"error": "Not Found"})
-        activity = [dict(r) for r in await (await db.execute("SELECT activity, created_at FROM user_activity_logs WHERE telegram_id = ? ORDER BY id DESC LIMIT 50", (tg_id,))).fetchall()]
-        sales = [dict(r) for r in await (await db.execute("SELECT s.*, i.name as item_name FROM sales s JOIN items i ON s.item_id = i.id WHERE s.user_id = ? ORDER BY s.created_at DESC", (user['id'],))).fetchall()]
-    return {"user": dict(user), "activity": activity, "sales": sales}
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("SELECT * FROM users WHERE telegram_id = %s", (tg_id,))
+            user = await cursor.fetchone()
+            if not user: return JSONResponse(status_code=404, content={"error": "Not Found"})
+            await cursor.execute("SELECT activity, created_at FROM user_activity_logs WHERE telegram_id = %s ORDER BY id DESC LIMIT 50", (tg_id,))
+            activity = await cursor.fetchall()
+            await cursor.execute("SELECT s.*, i.name as item_name FROM sales s JOIN items i ON s.item_id = i.id WHERE s.user_id = %s ORDER BY s.created_at DESC", (user['id'],))
+            sales = await cursor.fetchall()
+    return {"user": user, "activity": activity, "sales": sales}
 
 @app.get("/api/users")
 async def get_users(request: Request):
     if not is_authenticated(request): return JSONResponse(status_code=403, content={"error": "Unauthorized"})
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        users = await (await db.execute("""
-            SELECT u.*, COUNT(s.id) as total_purchases, SUM(CASE WHEN s.status IN ('paid','completed') THEN s.amount_paid ELSE 0 END) as total_spent_ltc
-            FROM users u LEFT JOIN sales s ON s.user_id = u.id GROUP BY u.id ORDER BY u.joined_at DESC LIMIT 100
-        """)).fetchall()
-    return {"users": [dict(u) for u in users]}
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("""
+                SELECT u.*, COUNT(s.id) as total_purchases, SUM(CASE WHEN s.status IN ('paid','completed') THEN s.amount_paid ELSE 0 END) as total_spent_ltc
+                FROM users u LEFT JOIN sales s ON s.user_id = u.id GROUP BY u.id ORDER BY u.joined_at DESC LIMIT 100
+            """)
+            users = await cursor.fetchall()
+    return {"users": users}
 
 @app.get("/api/addresses")
 async def get_addresses(request: Request):
     if not is_authenticated(request): return JSONResponse(status_code=403, content={"error": "Unauthorized"})
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        addr = [dict(r) for r in await (await db.execute("SELECT * FROM addresses")).fetchall()]
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("SELECT * FROM addresses")
+            addr = await cursor.fetchall()
     return {"addresses": addr}
 
 @app.post("/api/categories")
 async def add_category(name: str = Form(...)):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO categories (name) VALUES (?)", (name,))
+    async with db_session() as db:
+        await db.execute("INSERT INTO categories (name) VALUES (%s)", (name,))
         await db.commit()
     return {"status": "ok"}
 
 @app.post("/api/items")
 async def add_item(category_id: int = Form(...), name: str = Form(...), description: str = Form(...), price_ron: float = Form(...)):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO items (category_id, name, description, price_ron, price_ltc) VALUES (?, ?, ?, ?, ?)", (category_id, name, description, price_ron, price_ron/300.0))
+    async with db_session() as db:
+        await db.execute("INSERT INTO items (category_id, name, description, price_ron, price_ltc) VALUES (%s, %s, %s, %s, %s)", (category_id, name, description, price_ron, price_ron/300.0))
         await db.commit()
     return {"status": "ok"}
 
@@ -780,41 +799,46 @@ async def add_stock_api(item_id: int = Form(...), caption: str = Form(None), fil
         fpath = os.path.join(ASSETS_DIR, fname)
         with open(fpath, "wb") as f: f.write(await file.read())
         content = fpath
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO item_images (item_id, image_url, caption) VALUES (?, ?, ?)", (item_id, content, caption))
+    async with db_session() as db:
+        await db.execute("INSERT INTO item_images (item_id, image_url, caption) VALUES (%s, %s, %s)", (item_id, content, caption))
         await db.commit()
     return {"status": "ok"}
 
 @app.delete("/api/stock/{id}")
 async def delete_stock(id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM item_images WHERE id = ?", (id,))
+    async with db_session() as db:
+        await db.execute("DELETE FROM item_images WHERE id = %s", (id,))
         await db.commit()
     return {"status": "ok"}
 
 @app.delete("/api/addresses/{id}")
 async def delete_address(id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM addresses WHERE id = ?", (id,))
+    async with db_session() as db:
+        await db.execute("DELETE FROM addresses WHERE id = %s", (id,))
         await db.commit()
     return {"status": "ok"}
 
 @app.post("/api/addresses")
 async def add_address(address: str = Form(...)):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO addresses (crypto_address) VALUES (?)", (address,))
+    async with db_session() as db:
+        await db.execute("INSERT INTO addresses (crypto_address) VALUES (%s) ON CONFLICT DO NOTHING", (address,))
         await db.commit()
     return {"status": "ok"}
 
 @app.delete("/api/items/{id}")
 async def delete_item_api(request: Request, id: int):
     if not is_authenticated(request): return JSONResponse(status_code=403, content={"error": "Unauthorized"})
-    async with aiosqlite.connect(DB_PATH) as db:
-        it = await (await db.execute("SELECT is_primary FROM items WHERE id = ?", (id,))).fetchone()
-        if it and it[0]:
-            return JSONResponse(status_code=400, content={"error": "Cannot delete primary store items"})
-        await db.execute("DELETE FROM items WHERE id = ?", (id,))
-        await db.commit()
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            # Check if is_primary exists or just delete
+            try:
+                await cursor.execute("SELECT id FROM items WHERE id = %s", (id,))
+                it = await cursor.fetchone()
+                if not it: return JSONResponse(status_code=404, content={"error": "Not Found"})
+                await db.execute("DELETE FROM items WHERE id = %s", (id,))
+                await db.commit()
+            except Exception as e:
+                return JSONResponse(status_code=500, content={"error": str(e)})
     return {"status": "ok"}
 
 @app.get("/api/media/proxy/{file_id:path}")

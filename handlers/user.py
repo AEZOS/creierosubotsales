@@ -1,7 +1,7 @@
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
 from utils.qr_gen import generate_ltc_qr
-from database import add_user, DB_PATH, get_and_create_sale, is_silent_mode, get_item_stats, get_user_total_sales, is_blackmagic_on
+from database import add_user, db_session, get_and_create_sale, is_silent_mode, get_item_stats, get_user_total_sales, is_blackmagic_on
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, InputMediaPhoto, BufferedInputFile
 from aiogram.fsm.context import FSMContext
 from datetime import datetime, timedelta
@@ -13,7 +13,7 @@ import os
 from utils.tatum import check_ltc_transaction
 from utils.ltc_price import get_ltc_ron_price, ron_to_ltc
 from utils.ui import smart_edit
-import aiosqlite
+import logging
 import logging
 import asyncio
 import time
@@ -38,11 +38,11 @@ async def update_inventory_cache():
         return
         
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM categories WHERE is_hidden = 0") as cursor:
+        async with db_session() as db:
+            async with db.cursor() as cursor:
+                await cursor.execute("SELECT * FROM categories WHERE is_hidden = FALSE")
                 inventory_cache["categories"] = [dict(r) for r in await cursor.fetchall()]
-            async with db.execute("SELECT * FROM items WHERE is_hidden = 0") as cursor:
+                await cursor.execute("SELECT * FROM items WHERE is_hidden = FALSE")
                 items_list = [dict(r) for r in await cursor.fetchall()]
                 inventory_cache["items"] = {i['id']: i for i in items_list}
             inventory_cache["last_update"] = now
@@ -60,30 +60,42 @@ admin_intention_messages = {} # sale_id -> [(admin_id, message_id, original_text
 async def check_and_show_pending(event: CallbackQuery | Message) -> bool:
     """Check if user has a pending order and show it if they do. Returns True if pending was found."""
     user_tg_id = event.from_user.id
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("""
-            SELECT sales.id, items.name, sales.amount_expected, sales.address_used, sales.created_at, items.price_ron, sales.status
-            FROM sales 
-            JOIN items ON sales.item_id = items.id 
-            JOIN users ON sales.user_id = users.id
-            WHERE users.telegram_id = ? AND sales.status IN ('pending', 'confirming')
-        """, (user_tg_id,)) as cursor:
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("""
+                SELECT s.id, i.name as item_name, s.amount_expected, s.address_used, s.created_at, i.price_ron, s.status
+                FROM sales s
+                JOIN items i ON s.item_id = i.id 
+                JOIN users u ON s.user_id = u.id
+                WHERE u.telegram_id = %s AND s.status IN ('pending', 'confirming')
+            """, (user_tg_id,))
             pending = await cursor.fetchone()
 
     if pending:
-        sale_id, item_name, amount_ltc, address, created_at, price_ron, status = pending
+        sale_id = pending['id']
+        item_name = pending['item_name']
+        amount_ltc = pending['amount_expected']
+        address = pending['address_used']
+        created_at = pending['created_at']
+        price_ron = pending['price_ron']
+        status = pending['status']
         
         # Calculate time left
-        created_dt = datetime.strptime(created_at, '%Y-%m-%d %H:%M:%S')
+        if isinstance(created_at, str):
+            created_dt = datetime.strptime(created_at, '%Y-%m-%d %H:%M:%S')
+        else:
+            created_dt = created_at
         expiry_dt = created_dt + timedelta(minutes=DEPOSIT_TIMEOUT_MINUTES)
         now = datetime.now()
         
         # Don't auto-cancel if it's already confirming
         if now > expiry_dt and status == 'pending':
             # Silent auto-cancel if they try to access an expired order
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE sales SET status = 'cancelled' WHERE id = ? AND status = 'pending'", (sale_id,))
-                await db.execute("UPDATE addresses SET in_use_by_sale_id = NULL, locked_until = NULL WHERE in_use_by_sale_id = ?", (sale_id,))
+            async with db_session() as db:
+                await db.execute("UPDATE sales SET status = 'cancelled' WHERE id = %s AND status = 'pending'", (sale_id,))
+                await db.execute("UPDATE addresses SET in_use_by_sale_id = NULL, locked_until = NULL WHERE in_use_by_sale_id = %s", (sale_id,))
+                # No commit needed if using psycopg conn as context manager or we called commit inside
+                # I'll call commit just to be safe if db_session doesn't auto-commit
                 await db.commit()
 
             if isinstance(event, CallbackQuery):
@@ -216,16 +228,17 @@ async def cb_menu_profile(callback: CallbackQuery):
     if await check_cooldown(callback): return
     if await check_and_show_pending(callback): return
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("""
-            SELECT items.name, sales.amount_expected, sales.created_at, sales.id, items.price_ron, sales.status
-            FROM sales 
-            JOIN items ON sales.item_id = items.id 
-            JOIN users ON sales.user_id = users.id
-            WHERE users.telegram_id = ?
-            ORDER BY sales.created_at DESC
-            LIMIT 10
-        """, (callback.from_user.id,)) as cursor:
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("""
+                SELECT i.name, s.amount_expected, s.created_at, s.id, i.price_ron, s.status
+                FROM sales s
+                JOIN items i ON s.item_id = i.id 
+                JOIN users u ON s.user_id = u.id
+                WHERE u.telegram_id = %s
+                ORDER BY s.created_at DESC
+                LIMIT 10
+            """, (callback.from_user.id,))
             orders = await cursor.fetchall()
             
     user = callback.from_user
@@ -250,29 +263,33 @@ async def cb_menu_profile(callback: CallbackQuery):
                 'pending': '⏳ În așteptare',
                 'confirming': '🔄 Verificare'
             }
-            s_label = status_map.get(o[5], o[5])
-            text += f"🔹 #{o[3]} | <b>{o[0]}</b>\nPreț: {int(o[4])} RON | {s_label}\n\n"
-            if o[5] == 'paid':
-                kb_buttons.append([InlineKeyboardButton(text=f"👁 Vezi Conținut #{o[3]}", callback_data=f"view_secret_{o[3]}")])
-            elif o[5] in ('pending', 'confirming'):
-                kb_buttons.append([InlineKeyboardButton(text=f"🛍 Vezi Comandă Activă #{o[3]}", callback_data="check_pending_manual")])
+            s_label = status_map.get(o['status'], o['status'])
+            text += f"🔹 #{o['id']} | <b>{o['name']}</b>\nPreț: {int(o['price_ron'])} RON | {s_label}\n\n"
+            if o['status'] == 'paid':
+                kb_buttons.append([InlineKeyboardButton(text=f"👁 Vezi Conținut #{o['id']}", callback_data=f"view_secret_{o['id']}")])
+            elif o['status'] in ('pending', 'confirming'):
+                kb_buttons.append([InlineKeyboardButton(text=f"🛍 Vezi Comandă Activă #{o['id']}", callback_data="check_pending_manual")])
         
     # Add review buttons for completed orders
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("""
-            SELECT s.id, i.name, r.id
-            FROM sales s
-            JOIN items i ON s.item_id = i.id
-            LEFT JOIN reviews r ON s.id = r.sale_id
-            WHERE s.user_id = (SELECT id FROM users WHERE telegram_id = ?)
-              AND s.status = 'paid'
-            ORDER BY s.id DESC LIMIT 10
-        """, (callback.from_user.id,)) as cursor:
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("""
+                SELECT s.id, i.name as item_name, r.id as review_id
+                FROM sales s
+                JOIN items i ON s.item_id = i.id
+                LEFT JOIN reviews r ON s.id = r.sale_id
+                WHERE s.user_id = (SELECT id FROM users WHERE telegram_id = %s)
+                  AND s.status = 'paid'
+                ORDER BY s.id DESC LIMIT 10
+            """, (callback.from_user.id,))
             recent_paid = await cursor.fetchall()
 
     if recent_paid:
         text += "\n⭐ <b>Lasă o Recenzie:</b>\n"
-        for s_id, s_iname, s_rev_id in recent_paid:
+        for s_row in recent_paid:
+            s_id = s_row['id']
+            s_iname = s_row['item_name']
+            s_rev_id = s_row['review_id']
             if s_rev_id:
                 kb_buttons.append([InlineKeyboardButton(text=f"✅ {s_iname} (Recenzat)", callback_data="noop")])
             else:
@@ -303,35 +320,42 @@ async def cb_view_order_secret(callback: CallbackQuery):
     if await check_and_show_pending(callback): return
     sale_id = int(callback.data.split("_")[2])
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("""
-            SELECT items.name, users.telegram_id, img.secret_group, img.id
-            FROM sales
-            JOIN items ON sales.item_id = items.id
-            JOIN users ON sales.user_id = users.id
-            JOIN item_images img ON sales.image_id = img.id
-            WHERE sales.id = ? AND sales.status = 'paid'
-        """, (sale_id,)) as cursor:
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("""
+                SELECT i.name, u.telegram_id, img.secret_group, img.id as image_id
+                FROM sales s
+                JOIN items i ON s.item_id = i.id
+                JOIN users u ON s.user_id = u.id
+                JOIN item_images img ON s.image_id = img.id
+                WHERE s.id = %s AND s.status = 'paid'
+            """, (sale_id,))
             data = await cursor.fetchone()
             
-    if not data or data[1] != callback.from_user.id:
+    if not data or data['telegram_id'] != callback.from_user.id:
         await callback.answer("Comandă neautorizată sau inexistentă.", show_alert=True)
         return
         
-    name, user_tg_id, group_id, first_img_id = data
+    name = data['name']
+    user_tg_id = data['telegram_id']
+    group_id = data['secret_group']
+    first_img_id = data['image_id']
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        if group_id:
-            async with db.execute("SELECT image_url, media_type, caption FROM item_images WHERE secret_group = ?", (group_id,)) as cursor:
-                contents = await cursor.fetchall()
-        else:
-            async with db.execute("SELECT image_url, media_type, caption FROM item_images WHERE id = ?", (first_img_id,)) as cursor:
-                contents = await cursor.fetchall()
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            if group_id:
+                await cursor.execute("SELECT image_url, media_type, caption FROM item_images WHERE secret_group = %s", (group_id,))
+            else:
+                await cursor.execute("SELECT image_url, media_type, caption FROM item_images WHERE id = %s", (first_img_id,))
+            contents = await cursor.fetchall()
 
     msg_text = f"📦 <b>Conținut Comandă #{sale_id}</b>\nProdus: <b>{name}</b>"
     await callback.bot.send_message(user_tg_id, msg_text)
 
-    for val, m_type, capt in contents:
+    for c_row in contents:
+        val = c_row['image_url']
+        m_type = c_row['media_type']
+        capt = c_row['caption']
         try:
             # Special check for 'encrypted' (stale) data from migration
             if isinstance(val, str) and "🔐 [ENCRYPTED-DATA" in val:
@@ -389,19 +413,20 @@ async def cb_menu_shop(callback: CallbackQuery):
     if await check_cooldown(callback): return
     if await check_and_show_pending(callback): return
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("""
-            SELECT c.id, c.name,
-                (
-                    SELECT (COUNT(DISTINCT secret_group) + COUNT(CASE WHEN secret_group IS NULL THEN 1 END))
-                    FROM item_images im
-                    JOIN items i ON im.item_id = i.id
-                    WHERE i.category_id = c.id AND im.is_sold = 0
-                ) -
-                (SELECT COUNT(*) FROM items i JOIN sales s ON i.id = s.item_id WHERE i.category_id = c.id AND s.status = 'confirming') as stock_count
-            FROM categories c
-            WHERE c.is_hidden = 0
-        """) as cursor:
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("""
+                SELECT c.id, c.name,
+                    (
+                        SELECT (COUNT(DISTINCT secret_group) + COUNT(CASE WHEN secret_group IS NULL THEN 1 END))
+                        FROM item_images im
+                        JOIN items i ON im.item_id = i.id
+                        WHERE i.category_id = c.id AND im.is_sold = FALSE
+                    ) -
+                    (SELECT COUNT(*) FROM items i JOIN sales s ON i.id = s.item_id WHERE i.category_id = c.id AND s.status = 'confirming') as stock_count
+                FROM categories c
+                WHERE c.is_hidden = FALSE
+            """)
             cats = await cursor.fetchall()
             
     if not cats:
@@ -412,7 +437,7 @@ async def cb_menu_shop(callback: CallbackQuery):
     kb_rows = []
     current_row = []
     for cat in cats:
-        cat_id, cat_name, stock = cat
+        cat_id, cat_name, stock = cat['id'], cat['name'], cat['stock_count']
         btn_text = f"{cat_name}"
         style = "success" if stock and stock > 0 else "danger"
         current_row.append(InlineKeyboardButton(text=btn_text, callback_data=f"shop_cat_{cat_id}", **{"style": style}))
@@ -481,53 +506,57 @@ async def cb_shop_cat(callback: CallbackQuery):
         await callback.answer("Eroare categorie", show_alert=True)
 
 async def show_category_logic(callback: CallbackQuery, cat_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT name, display_image, description FROM categories WHERE id = ?", (cat_id,)) as cursor:
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("SELECT name, display_image, description FROM categories WHERE id = %s", (cat_id,))
             cat_info = await cursor.fetchone()
             
         if not cat_info:
             await callback.answer("Categoria nu a fost găsită.", show_alert=True)
             return
             
-        cat_name, cat_img, cat_desc = cat_info
+        cat_name = cat_info['name']
+        cat_img = cat_info['display_image']
+        cat_desc = cat_info['description']
 
-        # Get average rating for this category
-        async with db.execute("""
-            SELECT AVG(rating), COUNT(reviews.id) 
-            FROM reviews 
-            JOIN sales ON reviews.sale_id = sales.id 
-            JOIN items ON sales.item_id = items.id 
-            WHERE items.category_id = ?
-        """, (cat_id,)) as cursor:
+        async with db.cursor() as cursor:
+            await cursor.execute("""
+                SELECT AVG(rating) as avg_rating, COUNT(r.id) as total_reviews
+                FROM reviews r 
+                JOIN sales s ON r.sale_id = s.id 
+                JOIN items i ON s.item_id = i.id 
+                WHERE i.category_id = %s
+            """, (cat_id,))
             rating_row = await cursor.fetchone()
             
-        avg_rating = rating_row[0] if rating_row and rating_row[0] else 0
-        total_reviews = rating_row[1] if rating_row else 0
+        avg_rating = rating_row['avg_rating'] if rating_row and rating_row['avg_rating'] else 0
+        total_reviews = rating_row['total_reviews'] if rating_row else 0
         
         rating_text = ""
         if total_reviews > 0:
             stars = "⭐" * int(round(avg_rating))
             rating_text = f"\n{stars} <b>{avg_rating:.1f}/5</b> (<i>{total_reviews} recenzii</i>)\n"
 
-        async with db.execute("""
-            SELECT items.id, items.name, items.price_ron, 
-                   (SELECT COUNT(DISTINCT secret_group) FROM item_images WHERE item_id = items.id AND is_sold = 0 AND secret_group IS NOT NULL) +
-                   (SELECT COUNT(*) FROM item_images WHERE item_id = items.id AND is_sold = 0 AND secret_group IS NULL) as raw_stock,
-                   (SELECT COUNT(*) FROM sales WHERE item_id = items.id AND status = 'confirming') as confirming_count
-            FROM items 
-            WHERE items.category_id = ? AND items.is_hidden = 0
-            GROUP BY items.id
-            ORDER BY items.price_ron ASC
-        """, (cat_id,)) as cursor:
+        async with db.cursor() as cursor:
+            await cursor.execute("""
+                SELECT i.id, i.name, i.price_ron, 
+                       (SELECT COUNT(DISTINCT secret_group) FROM item_images WHERE item_id = i.id AND is_sold = FALSE AND secret_group IS NOT NULL) +
+                       (SELECT COUNT(*) FROM item_images WHERE item_id = i.id AND is_sold = FALSE AND secret_group IS NULL) as raw_stock,
+                       (SELECT COUNT(*) FROM sales WHERE item_id = i.id AND status = 'confirming') as confirming_count
+                FROM items i
+                WHERE i.category_id = %s AND i.is_hidden = FALSE
+                GROUP BY i.id
+                ORDER BY i.price_ron ASC
+            """, (cat_id,))
             rows = await cursor.fetchall()
             
         items = []
         for r in rows:
-            i_id = r[0]
-            i_name = r[1]
-            p_ron = r[2]
-            raw_stock = r[3]
-            conf_count = r[4]
+            i_id = r['id']
+            i_name = r['name']
+            p_ron = r['price_ron']
+            raw_stock = r['raw_stock']
+            conf_count = r['confirming_count']
             adj_stock = max(0, raw_stock - conf_count)
             items.append({
                 'id': i_id,
@@ -584,26 +613,35 @@ async def cb_shop_item(callback: CallbackQuery):
     if await check_and_show_pending(callback): return
     item_id = int(callback.data.split("_")[2])
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("""
-            SELECT items.name, items.description, items.price_ron, items.price_ltc, 
-                   (SELECT COUNT(DISTINCT secret_group) FROM item_images WHERE item_id = items.id AND is_sold = 0 AND secret_group IS NOT NULL) +
-                   (SELECT COUNT(*) FROM item_images WHERE item_id = items.id AND is_sold = 0 AND secret_group IS NULL),
-                   items.display_image, categories.display_image,
-                   (SELECT COUNT(*) FROM sales WHERE item_id = items.id AND status = 'confirming'),
-                   items.category_id
-            FROM items 
-            JOIN categories ON items.category_id = categories.id
-            WHERE items.id = ?
-            GROUP BY items.id
-        """, (item_id,)) as cursor:
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("""
+                SELECT i.name, i.description, i.price_ron, i.price_ltc, 
+                       (SELECT COUNT(DISTINCT secret_group) FROM item_images WHERE item_id = i.id AND is_sold = FALSE AND secret_group IS NOT NULL) +
+                       (SELECT COUNT(*) FROM item_images WHERE item_id = i.id AND is_sold = FALSE AND secret_group IS NULL) as raw_stock,
+                       i.display_image as item_img, c.display_image as cat_img,
+                       (SELECT COUNT(*) FROM sales WHERE item_id = i.id AND status = 'confirming') as confirming_count,
+                       i.category_id
+                FROM items i
+                JOIN categories c ON i.category_id = c.id
+                WHERE i.id = %s
+                GROUP BY i.id, c.display_image
+            """, (item_id,))
             item = await cursor.fetchone()
             
     if not item:
         await callback.answer("Produsul nu a fost găsit", show_alert=True)
         return
 
-    name, desc, p_ron, p_ltc, raw_stock, item_img, cat_img, confirming_count, cat_id = item
+    name = item['name']
+    desc = item['description']
+    p_ron = item['price_ron']
+    p_ltc = item['price_ltc']
+    raw_stock = item['raw_stock']
+    item_img = item['item_img']
+    cat_img = item['cat_img']
+    confirming_count = item['confirming_count']
+    cat_id = item['category_id']
     stock = max(0, raw_stock - confirming_count)
     display_img = item_img if item_img else cat_img
     
@@ -660,42 +698,39 @@ async def cb_preorder(callback: CallbackQuery):
     item_id = int(callback.data.split("_")[1])
     user_tg_id = callback.from_user.id
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        from datetime import datetime, timedelta
-        limit_time = (datetime.now() - timedelta(hours=6)).strftime('%Y-%m-%d %H:%M:%S')
-        
-        async with db.execute("""
-            SELECT created_at FROM preorders 
-            WHERE user_id = (SELECT id FROM users WHERE telegram_id = ?) 
-            AND created_at > ?
-            ORDER BY created_at DESC LIMIT 1
-        """, (user_tg_id, limit_time)) as cursor:
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            # Check for recent preorders (within 6 hours)
+            limit_time = datetime.now() - timedelta(hours=6)
+            
+            await cursor.execute("""
+                SELECT created_at FROM preorders 
+                WHERE user_id = (SELECT id FROM users WHERE telegram_id = %s) 
+                AND created_at > %s
+                ORDER BY created_at DESC LIMIT 1
+            """, (user_tg_id, limit_time))
             last_preorder = await cursor.fetchone()
             
-        if last_preorder:
-            await callback.answer("⏳ Poți face o singură precomandă la 6 ore. Revino mai târziu!", show_alert=True)
-            return
+            if last_preorder:
+                await callback.answer("⏳ Poți face o singură precomandă la 6 ore. Revino mai târziu!", show_alert=True)
+                return
 
-        async with db.execute("SELECT name FROM items WHERE id = ?", (item_id,)) as cursor:
+            await cursor.execute("SELECT name FROM items WHERE id = %s", (item_id,))
             item = await cursor.fetchone()
             
-    if not item:
-        await callback.answer("Produsul nu a fost găsit", show_alert=True)
-        return
-        
-    item_name = item[0]
-    user = callback.from_user
-    full_name = f"{user.first_name} {user.last_name or ''}".strip()
-    username = f"@{user.username}" if user.username else "N/A"
-    
-    # NEW: Insert FIRST to get the ID for the management button
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "INSERT INTO preorders (user_id, item_id) VALUES ((SELECT id FROM users WHERE telegram_id = ?), ?)",
-            (user_tg_id, item_id)
-        )
-        preo_id = cursor.lastrowid
-        await db.commit()
+            if not item:
+                await callback.answer("Produsul nu a fost găsit", show_alert=True)
+                return
+                
+            item_name = item['name']
+            
+            # Insert preorder and get ID
+            await cursor.execute(
+                "INSERT INTO preorders (user_id, item_id) VALUES ((SELECT id FROM users WHERE telegram_id = %s), %s) RETURNING id",
+                (user_tg_id, item_id)
+            )
+            preo_id = (await cursor.fetchone())['id']
+            await db.commit()
 
     admin_text = (
         f"💎 <b>CERERE NOUĂ PRECOMANDĂ (# {preo_id})</b>\n\n"
@@ -733,15 +768,17 @@ async def cb_buy_item(callback: CallbackQuery):
 
     item_id = int(callback.data.split("_")[2])
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT name, price_ron FROM items WHERE id = ?", (item_id,)) as cursor:
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("SELECT name, price_ron FROM items WHERE id = %s", (item_id,))
             item = await cursor.fetchone()
             
     if not item:
         await callback.answer("Produsul nu a fost găsit", show_alert=True)
         return
         
-    name, p_ron = item
+    name = item['name']
+    p_ron = item['price_ron']
     
     ltc_rate = await get_ltc_ron_price()
     price = ron_to_ltc(p_ron, ltc_rate)
@@ -839,47 +876,58 @@ async def cb_verify_payment(callback: CallbackQuery):
 
     active_verifications.add(sale_id)
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("""
-                SELECT items.name, sales.amount_expected, sales.address_used, sales.created_at, users.telegram_id, items.id, sales.status, addresses.last_tx_hash
-                FROM sales 
-                JOIN items ON sales.item_id = items.id
-                JOIN users ON sales.user_id = users.id
-                JOIN addresses ON sales.address_used = addresses.crypto_address
-                WHERE sales.id = ?
-            """, (sale_id,)) as cursor:
+        async with db_session() as db:
+            async with db.cursor() as cursor:
+                await cursor.execute("""
+                    SELECT i.name as item_name, s.amount_expected, s.address_used, s.created_at, u.telegram_id, i.id as item_id, s.status, a.last_tx_hash
+                    FROM sales s 
+                    JOIN items i ON s.item_id = i.id
+                    JOIN users u ON s.user_id = u.id
+                    JOIN addresses a ON s.address_used = a.crypto_address
+                    WHERE s.id = %s
+                """, (sale_id,))
                 sale_data = await cursor.fetchone()
-                
-        if not sale_data:
-            logging.error(f"Verify payment: Sale {sale_id} not found")
-            await callback.answer("❌ Comanda nu a fost găsită.", show_alert=True)
-            await callback.message.delete()
-            return
-            
-        item_name, price, address, created_at, user_tg_id, item_id, current_status, last_tx = sale_data
-
-        logging.info(f"VERIFY START | sale={sale_id} | user={user_tg_id} | item={item_name} | addr={address} | expected={price} LTC | status={current_status}")
-
-        if current_status == 'cancelled':
-            await callback.answer("⚠️ Această comandă a fost deja anulată.", show_alert=True)
-            try:
+                    
+            if not sale_data:
+                logging.error(f"Verify payment: Sale {sale_id} not found")
+                await callback.answer("❌ Comanda nu a fost găsită.", show_alert=True)
                 await callback.message.delete()
-            except:
-                pass
-            return
+                return
+                
+            item_name = sale_data['item_name']
+            price = sale_data['amount_expected']
+            address = sale_data['address_used']
+            created_at = sale_data['created_at']
+            user_tg_id = sale_data['telegram_id']
+            item_id = sale_data['item_id']
+            current_status = sale_data['status']
+            last_tx = sale_data['last_tx_hash']
 
-        if current_status == 'paid':
-            await callback.answer("✅ Această comandă a fost deja plătită și livrată.", show_alert=True)
-            return
+            logging.info(f"VERIFY START | sale={sale_id} | user={user_tg_id} | item={item_name} | addr={address} | expected={price} LTC | status={current_status}")
+
+            if current_status == 'cancelled':
+                await callback.answer("⚠️ Această comandă a fost deja anulată.", show_alert=True)
+                try:
+                    await callback.message.delete()
+                except:
+                    pass
+                return
+
+            if current_status == 'paid':
+                await callback.answer("✅ Această comandă a fost deja plătită și livrată.", show_alert=True)
+                return
         
-        created_dt = datetime.strptime(created_at, '%Y-%m-%d %H:%M:%S')
+        if isinstance(created_at, str):
+            created_dt = datetime.strptime(created_at, '%Y-%m-%d %H:%M:%S')
+        else:
+            created_dt = created_at
         expiry_dt = created_dt + timedelta(minutes=DEPOSIT_TIMEOUT_MINUTES)
         
         if datetime.now() > expiry_dt:
-            async with aiosqlite.connect(DB_PATH) as db:
-                cooldown_str = (datetime.now() + timedelta(minutes=30)).strftime('%Y-%m-%d %H:%M:%S')
-                await db.execute("UPDATE sales SET status = 'cancelled' WHERE id = ?", (sale_id,))
-                await db.execute("UPDATE addresses SET in_use_by_sale_id = NULL, locked_until = ? WHERE in_use_by_sale_id = ?", (cooldown_str, sale_id))
+            async with db_session() as db:
+                cooldown_str = datetime.now() + timedelta(minutes=30)
+                await db.execute("UPDATE sales SET status = 'cancelled' WHERE id = %s", (sale_id,))
+                await db.execute("UPDATE addresses SET in_use_by_sale_id = NULL, locked_until = %s WHERE in_use_by_sale_id = %s", (cooldown_str, sale_id))
                 await db.commit()
             await smart_edit(callback, "⚠️ Această comandă a expirat și a fost anulată automat.")
             await callback.answer()
@@ -901,8 +949,8 @@ async def cb_verify_payment(callback: CallbackQuery):
         logging.info(f"Initial check | found_tx={found_tx} | confs={confs} | tx={tx_hash} | paid={paid_amount} | needs_review={needs_review}")
 
         if found_tx and needs_review:
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE sales SET status = 'confirming', tx_hash = ?, amount_paid = ? WHERE id = ?", (tx_hash, paid_amount, sale_id))
+            async with db_session() as db:
+                await db.execute("UPDATE sales SET status = 'confirming', tx_hash = %s, amount_paid = %s WHERE id = %s", (tx_hash, float(paid_amount), sale_id))
                 await db.commit()
 
             diff_pct = round((paid_amount - price) / price * 100, 2)
@@ -947,8 +995,8 @@ async def cb_verify_payment(callback: CallbackQuery):
         if found_tx:
             logging.info(f"VERIFY | Found tx for sale {sale_id} | confs={confs} type={type(confs)}")
             if confs < 1:
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute("UPDATE sales SET status = 'confirming', tx_hash = ? WHERE id = ?", (tx_hash, sale_id))
+                async with db_session() as db:
+                    await db.execute("UPDATE sales SET status = 'confirming', tx_hash = %s WHERE id = %s", (tx_hash, sale_id))
                     await db.commit()
 
                 logging.info(f"Transaction found → status=confirming | tx={tx_hash}")
@@ -984,71 +1032,75 @@ async def cb_verify_payment(callback: CallbackQuery):
         if found_tx and not needs_review and confs >= 1:
             logging.info(f"DELIVERY TRIGGER | sale={sale_id} | confs={confs} | tx={tx_hash}")
 
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("BEGIN IMMEDIATE")
-                try:
-                    # 1. Double check duplication with lock
-                    async with db.execute("SELECT id FROM sales WHERE tx_hash = ? AND id != ? AND status IN ('paid', 'confirming')", (tx_hash, sale_id)) as cursor:
+            async with db_session() as db:
+                async with db.cursor() as cursor:
+                    try:
+                        # 1. Double check duplication with lock
+                        await cursor.execute("SELECT id FROM sales WHERE tx_hash = %s AND id != %s AND status IN ('paid', 'confirming')", (tx_hash, sale_id))
                         if await cursor.fetchone():
                             logging.warning(f"Duplicate tx_hash! Blocked delivery for sale {sale_id}")
-                            await db.execute("ROLLBACK")
                             await update_status("❌ Această tranzacție a fost deja procesată pentru o altă comandă.")
                             return
 
-                    # 2. Select available item (Grouped or Single)
-                    async with db.execute("""
-                        SELECT id, image_url, media_type, secret_group 
-                        FROM item_images 
-                        WHERE item_id = ? AND is_sold = 0 
-                        LIMIT 1
-                    """, (item_id,)) as cursor:
+                        # 2. Select available item (Grouped or Single)
+                        await cursor.execute("""
+                            SELECT id, image_url, media_type, secret_group 
+                            FROM item_images 
+                            WHERE item_id = %s AND is_sold = FALSE 
+                            LIMIT 1
+                        """, (item_id,))
                         image_row = await cursor.fetchone()
                     
-                    if not image_row:
-                        logging.error(f"NO STOCK LEFT | sale={sale_id} | item_id={item_id}")
-                        await db.execute("ROLLBACK")
-                        await update_status("⚠️ Stoc epuizat. Contactați @creierosuz pentru refund sau alt pachet.")
-                        return
-                    
-                    img_db_id, img_url, m_type, group_id = image_row
-                    
-                    # 3. Retrieve whole bundle if grouped
-                    if group_id:
-                        async with db.execute("SELECT id, image_url, media_type, caption FROM item_images WHERE secret_group = ?", (group_id,)) as cursor:
-                            bundle_items = await cursor.fetchall()
-                    else:
-                        async with db.execute("SELECT id, image_url, media_type, caption FROM item_images WHERE id = ?", (img_db_id,)) as cursor:
-                            bundle_items = await cursor.fetchall()
+                        if not image_row:
+                            logging.error(f"NO STOCK LEFT | sale={sale_id} | item_id={item_id}")
+                            await update_status("⚠️ Stoc epuizat. Contactați @creierosuz pentru refund sau alt pachet.")
+                            return
+                        
+                        img_db_id = image_row['id']
+                        img_url = image_row['image_url']
+                        m_type = image_row['media_type']
+                        group_id = image_row['secret_group']
+                        
+                        # 3. Retrieve whole bundle if grouped
+                        if group_id:
+                            await cursor.execute("SELECT id, image_url, media_type, caption FROM item_images WHERE secret_group = %s", (group_id,))
+                        else:
+                            await cursor.execute("SELECT id, image_url, media_type, caption FROM item_images WHERE id = %s", (img_db_id,))
+                        bundle_items = await cursor.fetchall()
 
-                    # 4. Mark all as sold
-                    for b_id, _, _, _ in bundle_items:
-                        await db.execute("UPDATE item_images SET is_sold = 1 WHERE id = ?", (b_id,))
-                    
-                    # 5. Update Sale and release address
-                    cooldown_str = (datetime.now() + timedelta(minutes=3)).strftime('%Y-%m-%d %H:%M:%S')
-                    await db.execute("UPDATE sales SET status = 'paid', amount_paid = ?, image_id = ?, tx_hash = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?", (paid_amount, img_db_id, tx_hash, sale_id))
-                    await db.execute("""
-                        UPDATE addresses 
-                        SET in_use_by_sale_id = NULL, 
-                            locked_until = ?, 
-                            last_tx_hash = ?, 
-                            last_amount = ? 
-                        WHERE crypto_address = ?
-                    """, (cooldown_str, tx_hash, paid_amount, address))
-                    
-                    await db.commit()
-                    logging.info(f"DB updated: status=paid | content sold | address released")
-                except Exception as db_err:
-                    await db.execute("ROLLBACK")
-                    logging.error(f"DB ERROR during delivery: {repr(db_err)}")
-                    await update_status("❌ Eroare internă în timpul livrării. Contactați admin.")
-                    return
+                        # 4. Mark all as sold
+                        for b_row in bundle_items:
+                            await cursor.execute("UPDATE item_images SET is_sold = TRUE WHERE id = %s", (b_row['id'],))
+                        
+                        # 5. Update Sale and release address
+                        cooldown_str = datetime.now() + timedelta(minutes=3)
+                        await cursor.execute("UPDATE sales SET status = 'paid', amount_paid = %s, image_id = %s, tx_hash = %s, completed_at = CURRENT_TIMESTAMP WHERE id = %s", (float(paid_amount), img_db_id, tx_hash, sale_id))
+                        await cursor.execute("""
+                            UPDATE addresses 
+                            SET in_use_by_sale_id = NULL, 
+                                locked_until = %s, 
+                                last_tx_hash = %s, 
+                                last_amount = %s 
+                            WHERE crypto_address = %s
+                        """, (cooldown_str, tx_hash, float(paid_amount), address))
+                        
+                        await db.commit()
+                        logging.info(f"DB updated: status=paid | content sold | address released")
+                    except Exception as db_err:
+                        await db.rollback()
+                        logging.error(f"DB ERROR during delivery: {repr(db_err)}")
+                        await update_status("❌ Eroare internă în timpul livrării. Contactați admin.")
+                        return
 
             # 6. Physical Delivery
             black_magic = await is_blackmagic_on()
             await callback.bot.send_message(user_tg_id, f"🎉 <b>LIVRARE REUȘITĂ!</b>\n\n🆔 ID Comandă: <code>#{sale_id}</code>\nProdus: <b>{item_name}</b>\nSecretul tău:")
 
-            for b_id, b_url, b_type, b_capt in bundle_items:
+            for b_row in bundle_items:
+                b_id = b_row['id']
+                b_url = b_row['image_url']
+                b_type = b_row['media_type']
+                b_capt = b_row['caption']
                 try:
                     # Replace image if Black Magic is ON
                     delivery_file = b_url
@@ -1175,32 +1227,33 @@ async def cb_cancel_order(callback: CallbackQuery):
     if await check_cooldown(callback): return
     sale_id = int(callback.data.split("_")[2])
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT address_used, status FROM sales WHERE id = ?", (sale_id,)) as cursor:
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("SELECT address_used, status FROM sales WHERE id = %s", (sale_id,))
             row = await cursor.fetchone()
             
-        if row and row[1] == 'pending':
-            await db.execute("UPDATE sales SET status = 'cancelled' WHERE id = ?", (sale_id,))
-            await db.execute("UPDATE addresses SET in_use_by_sale_id = NULL, locked_until = NULL WHERE crypto_address = ?", (row[0],))
-            await db.commit()
-            
-            # Edit intention messages for admins
-            if sale_id in admin_intention_messages:
-                for a_id, m_id, original_text in admin_intention_messages[sale_id]:
-                    try:
-                        new_text = original_text.replace(
-                            "📝 <b>INTENȚIE CUMPĂRARE</b>",
-                            "❌ <b>INTENȚIE CUMPĂRARE [ANULATĂ DE CLIENT]</b>"
-                        )
-                        await callback.bot.edit_message_text(new_text, chat_id=a_id, message_id=m_id)
-                    except: pass
-                # Clean up memory
-                del admin_intention_messages[sale_id]
+            if row and row['status'] == 'pending':
+                await cursor.execute("UPDATE sales SET status = 'cancelled' WHERE id = %s", (sale_id,))
+                await cursor.execute("UPDATE addresses SET in_use_by_sale_id = NULL, locked_until = NULL WHERE crypto_address = %s", (row['address_used'],))
+                await db.commit()
                 
-            await callback.answer("Comandă anulată cu succes!", show_alert=True)
-        elif row and row[1] == 'confirming':
-            await callback.answer("⚠️ Nu poți anula o comandă în verificare!", show_alert=True)
-            return
+                # Edit intention messages for admins
+                if sale_id in admin_intention_messages:
+                    for a_id, m_id, original_text in admin_intention_messages[sale_id]:
+                        try:
+                            new_text = original_text.replace(
+                                "📝 <b>INTENȚIE CUMPĂRARE</b>",
+                                "❌ <b>INTENȚIE CUMPĂRARE [ANULATĂ DE CLIENT]</b>"
+                            )
+                            await callback.bot.edit_message_text(new_text, chat_id=a_id, message_id=m_id)
+                        except: pass
+                    # Clean up memory
+                    del admin_intention_messages[sale_id]
+                    
+                await callback.answer("Comandă anulată cu succes!", show_alert=True)
+            elif row and row['status'] == 'confirming':
+                await callback.answer("⚠️ Nu poți anula o comandă în verificare!", show_alert=True)
+                return
     
     try: await callback.message.delete()
     except: pass
@@ -1229,29 +1282,38 @@ async def show_reviews(callback: CallbackQuery):
     offset = int(parts[2]) if len(parts) > 2 else 0
     limit = 5
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("""
-            SELECT r.rating, r.comment, u.username, i.name, r.created_at, c.name
-            FROM reviews r
-            JOIN sales s ON r.sale_id = s.id
-            JOIN items i ON s.item_id = i.id
-            JOIN categories c ON i.category_id = c.id
-            JOIN users u ON r.user_id = u.id
-            ORDER BY r.id DESC LIMIT ? OFFSET ?
-        """, (limit, offset)) as cursor:
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("""
+                SELECT r.rating, r.comment, u.username, i.name as item_name, r.created_at, c.name as cat_name
+                FROM reviews r
+                JOIN sales s ON r.sale_id = s.id
+                JOIN items i ON s.item_id = i.id
+                JOIN categories c ON i.category_id = c.id
+                JOIN users u ON r.user_id = u.id
+                ORDER BY r.id DESC LIMIT %s OFFSET %s
+            """, (limit, offset))
             reviews = await cursor.fetchall()
-        async with db.execute("SELECT AVG(rating), COUNT(*) FROM reviews") as cursor:
+            
+            await cursor.execute("SELECT AVG(rating) as avg_rating, COUNT(*) as total_reviews FROM reviews")
             avg_data = await cursor.fetchone()
 
-    avg_rating = round(avg_data[0] or 0, 1)
-    total_reviews = avg_data[1] or 0
+    avg_rating = round(float(avg_data['avg_rating'] or 0), 1)
+    total_reviews = avg_data['total_reviews'] or 0
 
     if total_reviews == 0:
         text = "⭐ <b>RECENZII</b>\n\nNu există recenzii momentan. Fii primul care lasă una după o achiziție!"
         kb_buttons = [[InlineKeyboardButton(text="🔙 Înapoi la meniu", callback_data="menu_start")]]
     else:
         text = f"⭐ <b>RECENZII CLIENȚI</b>\n\n📊 Notă medie: <b>{avg_rating}/5.0</b> ({total_reviews} recenzii)\n\n"
-        for rating, comment, uname, iname, created_at, cname in reviews:
+        for r_row in reviews:
+            rating = r_row['rating']
+            comment = r_row['comment']
+            uname = r_row['username']
+            iname = r_row['item_name']
+            created_at = r_row['created_at']
+            cname = r_row['cat_name']
+            
             stars = "⭐" * rating
             if uname:
                 if len(uname) > 4:
@@ -1262,7 +1324,12 @@ async def show_reviews(callback: CallbackQuery):
                     uname_disp = f"@{uname}**"
             else:
                 uname_disp = "Anonim"
-            date_disp = created_at.split()[0] if created_at else ""
+            
+            if isinstance(created_at, str):
+                date_disp = created_at.split()[0]
+            else:
+                date_disp = created_at.strftime('%Y-%m-%d')
+                
             cat_emoji = cname.split(" ")[0] if cname else ""
             text += f"{stars} <b>{cat_emoji} {iname}</b> - {uname_disp}\n"
             text += f"<i>\"{comment}\"</i>\n📅 {date_disp}\n\n"
@@ -1289,8 +1356,9 @@ async def show_reviews(callback: CallbackQuery):
 async def write_review_start(callback: CallbackQuery, state: FSMContext):
     sale_id = int(callback.data.split("_")[2])
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id FROM reviews WHERE sale_id = ?", (sale_id,)) as cursor:
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("SELECT id FROM reviews WHERE sale_id = %s", (sale_id,))
             if await cursor.fetchone():
                 return await callback.answer("Ai lăsat deja o recenzie pentru această comandă!", show_alert=True)
 
@@ -1330,28 +1398,29 @@ async def process_comment(message: Message, state: FSMContext):
     sale_id = data.get('sale_id')
     rating = data.get('rating')
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id FROM users WHERE telegram_id = ?", (message.from_user.id,)) as cursor:
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("SELECT id FROM users WHERE telegram_id = %s", (message.from_user.id,))
             user_row = await cursor.fetchone()
-        if not user_row:
-            await message.answer("❌ Eroare internă.")
-            await state.clear()
-            return
-        user_id = user_row[0]
-        try:
-            await db.execute(
-                "INSERT INTO reviews (sale_id, user_id, rating, comment) VALUES (?, ?, ?, ?)",
-                (sale_id, user_id, rating, comment)
-            )
-            await db.commit()
-            stars = "⭐" * rating
-            await message.answer(
-                f"✅ <b>Recenzia ta a fost salvată! Mulțumim!</b>\n\n"
-                f"{stars} | {comment}"
-            )
-        except Exception as e:
-            logging.error(f"Error saving review: {e}")
-            await message.answer("❌ Eroare la salvarea recenziei.")
+            if not user_row:
+                await message.answer("❌ Eroare internă.")
+                await state.clear()
+                return
+            user_id = user_row['id']
+            try:
+                await cursor.execute(
+                    "INSERT INTO reviews (sale_id, user_id, rating, comment) VALUES (%s, %s, %s, %s)",
+                    (sale_id, user_id, rating, comment)
+                )
+                await db.commit()
+                stars = "⭐" * rating
+                await message.answer(
+                    f"✅ <b>Recenzia ta a fost salvată! Mulțumim!</b>\n\n"
+                    f"{stars} | {comment}"
+                )
+            except Exception as e:
+                logging.error(f"Error saving review: {e}")
+                await message.answer("❌ Eroare la salvarea recenziei.")
     await state.clear()
 
 @router.callback_query(F.data.startswith("user_preo_valid_"))
@@ -1361,14 +1430,15 @@ async def cb_user_preo_valid_confirm(callback: CallbackQuery):
     preo_id = int(parts[4])
     
     if action == "yes":
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT i.name FROM preorders p JOIN items i ON p.item_id = i.id WHERE p.id = ?", (preo_id,)) as cursor:
+        async with db_session() as db:
+            async with db.cursor() as cursor:
+                await cursor.execute("SELECT i.name FROM preorders p JOIN items i ON p.item_id = i.id WHERE p.id = %s", (preo_id,))
                 row = await cursor.fetchone()
-            if not row: return await callback.answer("Nu mai există.")
-            i_name = row[0]
-            
-            await db.execute("UPDATE preorders SET status = 'confirmed' WHERE id = ?", (preo_id,))
-            await db.commit()
+                if not row: return await callback.answer("Nu mai există.")
+                i_name = row['name']
+                
+                await cursor.execute("UPDATE preorders SET status = 'confirmed' WHERE id = %s", (preo_id,))
+                await db.commit()
             
         await smart_edit(callback, "✅ <b>Ai confirmat că dorești produsul!</b>\n\nVânzătorul a fost notificat și va reveni cu un timp estimat de livrare.")
         
@@ -1386,8 +1456,8 @@ async def cb_user_preo_valid_confirm(callback: CallbackQuery):
             except: pass
             
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("DELETE FROM preorders WHERE id = ?", (preo_id,))
+        async with db_session() as db:
+            await db.execute("DELETE FROM preorders WHERE id = %s", (preo_id,))
             await db.commit()
         await smart_edit(callback, "❌ <b>Precomandă anulată.</b>\n\nMulțumim!")
     
@@ -1399,19 +1469,23 @@ async def cb_user_preo_valid_confirm(callback: CallbackQuery):
 async def cb_user_support_request(callback: CallbackQuery, state: FSMContext):
     sale_id = int(callback.data.split("_")[2])
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT completed_at, status FROM sales WHERE id = ?", (sale_id,)) as cursor:
+    async with db_session() as db:
+        async with db.cursor() as cursor:
+            await cursor.execute("SELECT completed_at, status FROM sales WHERE id = %s", (sale_id,))
             row = await cursor.fetchone()
             
-    if not row or not row[0]:
+    if not row or not row['completed_at']:
         return await callback.answer("Comandă nefinalizată sau suport indisponibil.", show_alert=True)
         
     try:
-        comp_at = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S')
+        comp_at = row['completed_at']
+        if isinstance(comp_at, str):
+            comp_at = datetime.strptime(comp_at, '%Y-%m-%d %H:%M:%S')
+            
         # SQLite's CURRENT_TIMESTAMP is UTC. 
         # Check diff in seconds.
         # We'll use datetime.utcnow() to compare correctly.
-        diff = (datetime.utcnow() - comp_at).total_seconds()
+        diff = (datetime.now() - comp_at).total_seconds()
         if diff > 7200: # 2 hours
             return await callback.answer("🆘 Timpul pentru suport a expirat (max 2h după livrare).", show_alert=True)
     except Exception as e:

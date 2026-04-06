@@ -9,7 +9,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
-from database import init_db, ensure_5_slots
+from database import init_db, ensure_5_slots, db_session
 from config import BOT_TOKEN
 from web_dashboard import app as web_app
 from handlers.user import router as user_router
@@ -71,18 +71,17 @@ async def _resolve_callback_label(cb: str) -> str:
     """Converts technical callback data to a human-readable Romanian label."""
     if not cb: return "Buton: [Fără date]"
     
-    from database import DB_PATH
-    import aiosqlite as _aio
-    
     # Category viewing
     if cb.startswith('shop_cat_'):
         try:
             parts = cb.split('_')
             cat_id = parts[2] if len(parts) > 2 else None
             if cat_id:
-                async with _aio.connect(DB_PATH) as db:
-                    row = await (await db.execute("SELECT name FROM categories WHERE id = ?", (cat_id,))).fetchone()
-                    if row: return f"🛍 Categorie: {row[0]}"
+                async with db_session() as db:
+                    async with db.cursor() as cursor:
+                        await cursor.execute("SELECT name FROM categories WHERE id = %s", (int(cat_id),))
+                        row = await cursor.fetchone()
+                        if row: return f"🛍 Categorie: {row['name']}"
         except: pass
         return f"🛍 Categorie #{cb.split('_')[2]}" if '_' in cb else f"Buton: {cb}"
         
@@ -92,9 +91,11 @@ async def _resolve_callback_label(cb: str) -> str:
             parts = cb.split('_')
             item_id = parts[2] if len(parts) > 2 else None
             if item_id:
-                async with _aio.connect(DB_PATH) as db:
-                    row = await (await db.execute("SELECT name FROM items WHERE id = ?", (item_id,))).fetchone()
-                    if row: return f"📦 Produs: {row[0]}"
+                async with db_session() as db:
+                    async with db.cursor() as cursor:
+                        await cursor.execute("SELECT name FROM items WHERE id = %s", (int(item_id),))
+                        row = await cursor.fetchone()
+                        if row: return f"📦 Produs: {row['name']}"
         except: pass
         return f"📦 Produs #{cb.split('_')[2]}" if '_' in cb else f"Buton: {cb}"
 
@@ -119,25 +120,19 @@ async def _log_and_cache_user(user, activity_text: str):
     
     # Cache profile photo if not already set
     try:
-        from database import DB_PATH
-        import aiosqlite as _aio
-        async with _aio.connect(DB_PATH) as db:
-            row = await (await db.execute(
-                "SELECT profile_photo FROM users WHERE telegram_id = ?",
-                (user.id,)
-            )).fetchone()
+        async with db_session() as db:
+            async with db.cursor() as cursor:
+                await cursor.execute("SELECT profile_photo FROM users WHERE telegram_id = %s", (user.id,))
+                row = await cursor.fetchone()
         
-        if row and not row[0] and _bot_ref:
+        if row and not row['profile_photo'] and _bot_ref:
             photos = await _bot_ref.get_user_profile_photos(user_id=user.id, limit=1)
             if photos and photos.total_count > 0:
                 best = photos.photos[0][-1]  # largest size
                 file_info = await _bot_ref.get_file(best.file_id)
                 photo_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
-                async with _aio.connect(DB_PATH) as db:
-                    await db.execute(
-                        "UPDATE users SET profile_photo = ? WHERE telegram_id = ?",
-                        (photo_url, user.id)
-                    )
+                async with db_session() as db:
+                    await db.execute("UPDATE users SET profile_photo = %s WHERE telegram_id = %s", (photo_url, user.id))
                     await db.commit()
                 logging.info(f"Cached profile photo for {user.id}")
     except Exception as e:
@@ -150,7 +145,10 @@ async def start_bot():
     global _bot_ref
     _bot_ref = bot
     await init_db()
-    await ensure_5_slots()
+    # ensure_5_slots is now called internally by init_db or we passed nothing here
+    # Actually database.py defines ensure_5_slots(conn), let's just use db_session here
+    async with db_session() as db:
+        await ensure_5_slots(db)
     
     dp.message.middleware(ActivityMiddleware())
     dp.callback_query.middleware(ActivityMiddleware())
@@ -191,11 +189,11 @@ async def run_serveo_tunnel(port: int):
             url = decoded_line.split("from")[1].strip()
             logging.info(f"✨ PUBLIC DASHBOARD URL: {url}")
             # Save the URL to DB for the /link command
-            import aiosqlite
-            from database import DB_PATH
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("INSERT OR REPLACE INTO bot_settings (key, value) VALUES ('dashboard_url', ?)", (url,))
-                await db.commit()
+            from database import get_db_conn
+            conn = await get_db_conn()
+            async with conn:
+                await conn.execute("INSERT INTO bot_settings (key, value) VALUES ('dashboard_url', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (url,))
+                await conn.commit()
         elif decoded_line:
             logging.info(f"Serveo: {decoded_line}")
 
@@ -220,11 +218,13 @@ async def lifespan(app: FastAPI):
                 url = os.getenv("KEEP_ALIVE_URL")
                 if not url:
                     # Try to fetch it from DB if it was a Serveo URL
-                    import aiosqlite
-                    from database import DB_PATH
-                    async with aiosqlite.connect(DB_PATH) as db:
-                        row = await (await db.execute("SELECT value FROM bot_settings WHERE key = 'dashboard_url'")).fetchone()
-                        if row: url = row[0]
+                    from database import get_db_conn
+                    conn = await get_db_conn()
+                    async with conn:
+                        async with conn.cursor() as cur:
+                            await cur.execute("SELECT value FROM bot_settings WHERE key = 'dashboard_url'")
+                            row = await cur.fetchone()
+                            if row: url = row['value']
                 
                 if url:
                     async with aiohttp.ClientSession() as session:

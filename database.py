@@ -8,15 +8,10 @@ from config import DATABASE_URL, DB_PATH
 # ⚡ Neon Persistence Helper
 async def get_db_conn():
     """Returns an async connection to Postgres (Neon) or SQLite (LOCAL fallback)."""
-    if DATABASE_URL:
-        # PostgreSQL (Neon) 
-        return await psycopg.AsyncConnection.connect(DATABASE_URL, row_factory=dict_row)
-    else:
-        # Local SQLite (Development only, no persistence on Render free)
-        import aiosqlite
-        conn = await aiosqlite.connect(DB_PATH)
-        conn.row_factory = aiosqlite.Row
-        return conn
+    if not DATABASE_URL:
+        raise RuntimeError("❌ DATABASE_URL is not set! Please configure it in your environment.")
+    # PostgreSQL (Neon) 
+    return await psycopg.AsyncConnection.connect(DATABASE_URL, row_factory=dict_row)
 
 from contextlib import asynccontextmanager
 

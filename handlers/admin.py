@@ -30,34 +30,54 @@ def is_admin(user_id: int) -> bool:
 @router.message(Command("check"))
 async def cmd_check_slots(message: Message, auth_id: int = None):
     if not is_admin(auth_id if auth_id is not None else message.from_user.id): return
-    
+    await show_addresses_menu(message)
+
+async def show_addresses_menu(reply_target):
+    """Shows the interactive LTC addresses management panel."""
     from datetime import datetime
     async with db_session() as db:
         async with db.cursor() as cursor:
-            await cursor.execute("SELECT crypto_address, in_use_by_sale_id, locked_until FROM addresses")
+            await cursor.execute("SELECT id, crypto_address, in_use_by_sale_id, locked_until FROM addresses ORDER BY id ASC")
             slots = await cursor.fetchall()
-            
-    text = "🔋 <b>STATUS SLOTURI LTC (Root):</b>\n\n"
+
     now = datetime.now()
-    for i, s in enumerate(slots, 1):
+    text = "� <b>GESTIONARE ADRESE LTC</b>\n\n"
+    kb_rows = []
+
+    for s in slots:
+        slot_id = s['id']
         addr = s['crypto_address']
         sale_id = s['in_use_by_sale_id']
         locked = s['locked_until']
-        status = "✅ DISPONIBIL"
-        if sale_id:
-            status = f"🛒 ÎN UZ (Comandă #{sale_id})"
-        elif locked:
-            try:
-                locked_dt = locked if not isinstance(locked, str) else datetime.strptime(locked, '%Y-%m-%d %H:%M:%S')
-                if locked_dt > now:
-                    status = f"🛡️ BLOCAT/COOLDOWN (Până la {locked_dt.strftime('%H:%M')})"
-            except: pass
-        elif not addr.startswith("UNSET_SLOT"):
-            status = "🔴 FOLOSIT"
-        
-        text += f"{i}. <code>{addr}</code>\n   ┗ {status}\n\n"
-        
-    await message.answer(text)
+
+        if addr.startswith("UNSET_SLOT"):
+            status = "⬜ NESETAT"
+            display = "(nesetat)"
+        elif sale_id:
+            status = f"🛒 ÎN UZ (#{sale_id})"
+            display = addr[:18] + "..."
+        else:
+            status = "✅ LIBER"
+            if locked:
+                try:
+                    locked_dt = locked if not isinstance(locked, str) else datetime.strptime(locked, '%Y-%m-%d %H:%M:%S')
+                    if locked_dt > now:
+                        status = f"🛡️ COOLDOWN ({locked_dt.strftime('%H:%M')})"
+                except: pass
+            display = addr[:18] + "..."
+
+        text += f"<b>Slot #{slot_id}</b> — {status}\n<code>{addr}</code>\n\n"
+        kb_rows.append([
+            InlineKeyboardButton(text=f"✏️ Set #{slot_id}",   callback_data=f"edit_slot_{slot_id}"),
+            InlineKeyboardButton(text=f"🗑️ Reset #{slot_id}", callback_data=f"reset_slot_{slot_id}")
+        ])
+
+    kb_rows.append([InlineKeyboardButton(text="🔙 Înapoi", callback_data="admin_main")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    # reply_target can be a Message or a CallbackQuery.message
+    await reply_target.answer(text, reply_markup=kb)
+
 
 @router.message(Command("silent"))
 async def cmd_silent_toggle(message: Message):
@@ -1435,25 +1455,53 @@ async def cb_admin_stock_finish(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("edit_slot_"))
 async def cb_edit_slot(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id): return
     slot_id = int(callback.data.split("_")[2])
     async with db_session() as db:
         async with db.cursor() as cursor:
             await cursor.execute("SELECT crypto_address FROM addresses WHERE id = %s", (slot_id,))
             row = await cursor.fetchone()
+    if not row:
+        return await callback.answer("Slot inexistent.", show_alert=True)
     await state.update_data(edit_slot_id=slot_id)
     await state.set_state(AdminAddress.waiting_for_address)
-    await callback.message.answer(f"📝 <b>Slot #{slot_id}</b>\nCurent: <code>{row['crypto_address']}</code>\nTrimite noua adresă LTC:")
+    await callback.message.answer(
+        f"✏️ <b>Setare Slot #{slot_id}</b>\n"
+        f"Curent: <code>{row['crypto_address']}</code>\n\n"
+        f"Trimite noua adresă LTC (sau /cancel pentru anulare):"
+    )
     await callback.answer()
+
+@router.callback_query(F.data.startswith("reset_slot_"))
+async def cb_reset_slot(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    slot_id = int(callback.data.split("_")[2])
+    async with db_session() as db:
+        await db.execute(
+            "UPDATE addresses SET crypto_address = %s, in_use_by_sale_id = NULL, locked_until = NULL WHERE id = %s",
+            (f"UNSET_SLOT_{slot_id}", slot_id)
+        )
+        await db.commit()
+    await callback.answer(f"✅ Slot #{slot_id} resetat!", show_alert=True)
+    # Refresh addresses menu in-place
+    await show_addresses_menu(callback.message)
 
 @router.message(AdminAddress.waiting_for_address)
 async def process_new_address(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id): return
     data = await state.get_data()
+    new_addr = message.text.strip()
+    if not new_addr or len(new_addr) < 26:
+        return await message.answer("⚠️ Adresă invalidă. Trimite o adresă LTC validă.")
     async with db_session() as db:
-        await db.execute("UPDATE addresses SET crypto_address = %s, in_use_by_sale_id = NULL WHERE id = %s", (message.text.strip(), data['edit_slot_id']))
+        await db.execute(
+            "UPDATE addresses SET crypto_address = %s, in_use_by_sale_id = NULL, locked_until = NULL WHERE id = %s",
+            (new_addr, data['edit_slot_id'])
+        )
         await db.commit()
-    await message.answer("✅ Slot actualizat!", reply_markup=admin_main_menu())
     await state.clear()
+    await message.answer(f"✅ Slot #{data['edit_slot_id']} actualizat la:\n<code>{new_addr}</code>")
+    await show_addresses_menu(message)
 
 # --- SUPPORT TICKETS ---
 

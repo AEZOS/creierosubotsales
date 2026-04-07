@@ -68,9 +68,15 @@ async def login_page():
 
 @app.post("/login")
 async def process_login(pin: str = Form(...)):
-    if pin == DASHBOARD_PIN:
+    if pin.strip() == DASHBOARD_PIN:
         response = RedirectResponse(url="/", status_code=303)
-        response.set_cookie(key="admin_session", value=pin, max_age=86400 * 7, httponly=True)
+        response.set_cookie(
+            key="admin_session",
+            value=pin.strip(),
+            max_age=86400 * 7,
+            httponly=True,
+            samesite="lax"
+        )
         return response
     return RedirectResponse(url="/login?error=1", status_code=303)
 

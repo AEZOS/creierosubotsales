@@ -830,7 +830,6 @@ async def cb_admin_history_bridge(callback: CallbackQuery):
     await cb_admin_stats_info(callback)
 
 @router.callback_query(F.data.startswith("adm_stats_"))
-
 async def cb_admin_stats(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
@@ -1114,11 +1113,7 @@ async def cb_view_single_secret(callback: CallbackQuery):
     await smart_edit(callback.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
     await callback.answer()
 
-@router.callback_query(F.data == "adm_stats_info")
-async def cb_admin_stats_info(callback: CallbackQuery):
-    await cmd_admin_info(callback.message)
-    await callback.message.delete()
-    await callback.answer()
+# NOTE: adm_stats_info handler is defined at line 767 (correct version with from_user spoof)
 
 # ===== APPROVAL / REJECTION =====
 
